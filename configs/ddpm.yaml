@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Конфигурация DDPM (UNet + Self-Attention + Cosine Schedule)
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  base_channels: 64     # базовое число каналов UNet (ch*8 = 512 в bottleneck)
+  time_emb_dim: 256     # размерность time embedding
+  timesteps: 1000       # T — количество шагов диффузии
+  schedule: cosine      # cosine | linear
+  dropout: 0.1
+
+training:
+  epochs: 200           # DDPM требует больше эпох чем VAE/GAN
+  batch_size: 16        # меньше batch_size из-за большей памяти UNet
+  lr: 2.0e-4
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_epochs: 5
+  grad_clip: 1.0
+  ema_decay: 0.9999     # exponential moving average весов (улучшает качество)
+
+data:
+  root: "./data"
+  val_frac: 0.05
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  save_every: 10        # сохранять чекпоинт каждые N эпох
+  sample_every: 20      # семплирование DDPM медленное — реже
+  log_every: 10
+  n_samples: 16         # меньше из-за медленного семплинга (T=1000 шагов)
+  output_dir: "./checkpoints/ddpm"

@@ -1,0 +1,29 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Конфигурация β-VAE
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  latent_dim: 256       # размерность латентного пространства
+  beta: 4.0             # β-VAE: beta=1 → vanilla VAE, beta>1 → более disentangled
+
+training:
+  epochs: 50
+  batch_size: 32
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  lr_scheduler: cosine  # cosine | step | none
+  warmup_epochs: 2      # линейный warmup перед cosine decay
+  grad_clip: 1.0        # gradient clipping (0 = отключено)
+
+data:
+  root: "./data"        # путь к папке data/ (содержит thumbnails128x128/)
+  val_frac: 0.05        # доля валидационных данных
+  num_workers: 4        # параллельные воркеры DataLoader
+  pin_memory: true
+
+logging:
+  save_every: 5         # сохранять чекпоинт каждые N эпох
+  sample_every: 5       # сохранять образцы каждые N эпох
+  log_every: 20         # выводить в консоль каждые N батчей
+  n_samples: 64         # количество генерируемых образцов
+  output_dir: "./checkpoints/vae"

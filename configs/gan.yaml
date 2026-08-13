@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Конфигурация DCGAN (с Spectral Norm + Self-Attention)
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  latent_dim: 100       # размерность шума z ~ N(0, I)
+  ngf: 64               # базовое число фильтров Generator
+  ndf: 64               # базовое число фильтров Discriminator
+
+training:
+  epochs: 100
+  batch_size: 32
+  lr_g: 2.0e-4          # learning rate Generator
+  lr_d: 2.0e-4          # learning rate Discriminator
+  beta1: 0.5            # Adam β₁ (из оригинальной статьи DCGAN)
+  beta2: 0.999
+  label_smooth: 0.1     # label smoothing: реальные → [0.9, 1.0]
+  n_critic: 1           # шагов D на 1 шаг G
+  grad_clip: 0.0        # 0 = отключено
+
+data:
+  root: "./data"
+  val_frac: 0.05
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  save_every: 10
+  sample_every: 5
+  log_every: 20
+  n_samples: 64
+  output_dir: "./checkpoints/gan"
