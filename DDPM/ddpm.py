@@ -1,16 +1,20 @@
 """
 DDPM (Denoising Diffusion Probabilistic Models)
-для изображений 128×128×3.
+для изображений 128x128x3.
 
 Особенности:
 
-  - Sinusoidal time embedding.
-  - ResNet blocks с time conditioning.
-  - Self-attention только на 16×16 и 8×8.
-  - Косинусное beta-расписание.
-  - Корректный posterior variance.
-  - Все timestep tensors создаются на device текущего batch.
-  - Совместимость с single-GPU и DistributedDataParallel.
+- Sinusoidal time embedding.
+- ResNet blocks с time conditioning.
+- Self-attention на 16x16 и 8x8.
+- Косинусное beta-расписание.
+- Корректный posterior variance.
+- DDPM sampling.
+- DDIM sampling.
+- Совместимость с Single-GPU.
+- Совместимость с DistributedDataParallel.
+- Все timestep tensors создаются на device текущего batch.
+- Коэффициенты diffusion заранее вычисляются.
 """
 
 from __future__ import annotations
@@ -23,15 +27,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class SinusoidalPositionEmbeddings(nn.Module):
-    """
-    Sinusoidal positional embedding для timestep t.
-    """
+# ============================================================================
+# Time embedding
+# ============================================================================
 
-    def __init__(
-        self,
-        dim: int,
-    ):
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    """Sinusoidal embedding для diffusion timestep."""
+
+    def __init__(self, dim: int):
         super().__init__()
 
         if dim < 4:
@@ -48,11 +52,11 @@ class SinusoidalPositionEmbeddings(nn.Module):
         half_dim = self.dim // 2
 
         exponent = (
-            math.log(10000)
-            / (half_dim - 1)
+            math.log(10000.0)
+            / max(half_dim - 1, 1)
         )
 
-        embeddings = torch.exp(
+        frequencies = torch.exp(
             torch.arange(
                 half_dim,
                 device=t.device,
@@ -62,15 +66,15 @@ class SinusoidalPositionEmbeddings(nn.Module):
         )
 
         embeddings = (
-            t[:, None].float()
-            * embeddings[None, :]
+            t.float()[:, None]
+            * frequencies[None, :]
         )
 
         embeddings = torch.cat(
-            [
+            (
                 embeddings.sin(),
                 embeddings.cos(),
-            ],
+            ),
             dim=-1,
         )
 
@@ -83,10 +87,13 @@ class SinusoidalPositionEmbeddings(nn.Module):
         return embeddings
 
 
+# ============================================================================
+# ResNet block
+# ============================================================================
+
+
 class ResNetBlock(nn.Module):
-    """
-    ResNet block с time embedding.
-    """
+    """ResNet block с conditioning по timestep."""
 
     def __init__(
         self,
@@ -99,8 +106,19 @@ class ResNetBlock(nn.Module):
 
         groups = min(
             8,
+            in_channels,
+        )
+
+        while in_channels % groups != 0:
+            groups -= 1
+
+        out_groups = min(
+            8,
             out_channels,
         )
+
+        while out_channels % out_groups != 0:
+            out_groups -= 1
 
         self.norm1 = nn.GroupNorm(
             groups,
@@ -125,7 +143,7 @@ class ResNetBlock(nn.Module):
         )
 
         self.norm2 = nn.GroupNorm(
-            groups,
+            out_groups,
             out_channels,
         )
 
@@ -163,13 +181,13 @@ class ResNetBlock(nn.Module):
         h = self.act(h)
         h = self.conv1(h)
 
-        time = self.time_proj(
+        time_emb = self.time_proj(
             temb
         )
 
         h = (
             h
-            + time[:, :, None, None]
+            + time_emb[:, :, None, None]
         )
 
         h = self.norm2(h)
@@ -180,14 +198,13 @@ class ResNetBlock(nn.Module):
         return h + self.skip(x)
 
 
-class SelfAttention2d(nn.Module):
-    """
-    Multi-head self-attention для feature map.
+# ============================================================================
+# Self attention
+# ============================================================================
 
-    Используется на небольших spatial resolution:
-        16×16
-        8×8
-    """
+
+class SelfAttention2d(nn.Module):
+    """Multi-head self-attention для 2D feature map."""
 
     def __init__(
         self,
@@ -203,17 +220,23 @@ class SelfAttention2d(nn.Module):
             )
 
         self.num_heads = num_heads
-
         self.head_dim = (
             channels // num_heads
         )
-
         self.scale = (
             self.head_dim ** -0.5
         )
 
+        groups = min(
+            8,
+            channels,
+        )
+
+        while channels % groups != 0:
+            groups -= 1
+
         self.norm = nn.GroupNorm(
-            min(8, channels),
+            groups,
             channels,
         )
 
@@ -280,8 +303,9 @@ class SelfAttention2d(nn.Module):
             * self.scale
         )
 
-        attention = attention.softmax(
-            dim=-1
+        attention = torch.softmax(
+            attention,
+            dim=-1,
         )
 
         out = torch.matmul(
@@ -311,15 +335,13 @@ class SelfAttention2d(nn.Module):
         )
 
 
-class DownBlock(nn.Module):
-    """
-    Encoder block:
+# ============================================================================
+# Encoder / decoder blocks
+# ============================================================================
 
-        ResNet
-        ResNet
-        optional attention
-        downsample
-    """
+
+class DownBlock(nn.Module):
+    """Encoder block."""
 
     def __init__(
         self,
@@ -384,15 +406,7 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """
-    Decoder block:
-
-        upsample
-        concatenate skip
-        ResNet
-        ResNet
-        optional attention
-    """
+    """Decoder block."""
 
     def __init__(
         self,
@@ -450,10 +464,10 @@ class UpBlock(nn.Module):
             )
 
         h = torch.cat(
-            [
+            (
                 h,
                 skip,
-            ],
+            ),
             dim=1,
         )
 
@@ -467,22 +481,25 @@ class UpBlock(nn.Module):
             temb,
         )
 
-        h = self.attn(h)
+        return self.attn(h)
 
-        return h
+
+# ============================================================================
+# UNet
+# ============================================================================
 
 
 class UNet(nn.Module):
     """
     U-Net для DDPM.
 
-    Для входа 128×128:
+    Для изображения 128x128:
 
-        128×128  base
-         64×64   base*2
-         32×32   base*4
-         16×16   base*8 + attention
-          8×8    base*8 + attention
+        128x128 -> base
+         64x64  -> base*2
+         32x32  -> base*4
+         16x16  -> base*8 + attention
+          8x8   -> base*8 + attention
     """
 
     def __init__(
@@ -543,11 +560,6 @@ class UNet(nn.Module):
         )
 
         # 32 -> 16
-        #
-        # Attention здесь выключен,
-        # потому что DownBlock применяет
-        # attention до downsample, то есть
-        # на resolution 32×32.
         self.down3 = DownBlock(
             ch * 4,
             ch * 8,
@@ -556,9 +568,9 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
-        # 16 -> 8
-        #
-        # Attention работает на 16×16.
+        # 16 -> 8.
+        # Attention выполняется до downsample,
+        # поэтому resolution здесь = 16x16.
         self.down4 = DownBlock(
             ch * 8,
             ch * 8,
@@ -567,6 +579,7 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
+        # Bottleneck: 8x8.
         self.mid_res1 = ResNetBlock(
             ch * 8,
             ch * 8,
@@ -585,9 +598,7 @@ class UNet(nn.Module):
             dropout,
         )
 
-        # 8 -> 16
-        #
-        # Attention работает на 16×16.
+        # 8 -> 16.
         self.up4 = UpBlock(
             ch * 8,
             ch * 8,
@@ -597,7 +608,7 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
-        # 16 -> 32
+        # 16 -> 32.
         self.up3 = UpBlock(
             ch * 8,
             ch * 8,
@@ -607,7 +618,7 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
-        # 32 -> 64
+        # 32 -> 64.
         self.up2 = UpBlock(
             ch * 4,
             ch * 4,
@@ -617,7 +628,7 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
-        # 64 -> 128
+        # 64 -> 128.
         self.up1 = UpBlock(
             ch * 2,
             ch * 2,
@@ -627,8 +638,16 @@ class UNet(nn.Module):
             dropout=dropout,
         )
 
+        groups = min(
+            8,
+            ch,
+        )
+
+        while ch % groups != 0:
+            groups -= 1
+
         self.out_norm = nn.GroupNorm(
-            min(8, ch),
+            groups,
             ch,
         )
 
@@ -713,32 +732,22 @@ class UNet(nn.Module):
         return self.out_conv(x)
 
 
+# ============================================================================
+# Beta schedule
+# ============================================================================
+
+
 def get_beta_schedule(
     timesteps: int,
     schedule: str = "cosine",
     beta_start: float = 1e-4,
     beta_end: float = 0.02,
 ) -> torch.Tensor:
-    """
-    Возвращает beta schedule.
+    """Создаёт beta schedule."""
 
-    Args:
-        timesteps:
-            Количество diffusion steps.
-
-        schedule:
-            "cosine" или "linear".
-
-        beta_start:
-            Начальное beta для linear.
-
-        beta_end:
-            Конечное beta для linear.
-    """
-
-    if timesteps < 2:
+    if timesteps <= 0:
         raise ValueError(
-            "timesteps должен быть >= 2."
+            "timesteps должен быть > 0."
         )
 
     if schedule == "linear":
@@ -746,6 +755,7 @@ def get_beta_schedule(
             beta_start,
             beta_end,
             timesteps,
+            dtype=torch.float32,
         )
 
     if schedule == "cosine":
@@ -760,18 +770,15 @@ def get_beta_schedule(
             dtype=torch.float32,
         )
 
-        alpha_bar = (
-            torch.cos(
-                (
-                    (x / timesteps)
-                    + s
-                )
-                / (1 + s)
-                * math.pi
-                * 0.5
+        alpha_bar = torch.cos(
+            (
+                x / timesteps
+                + s
             )
-            ** 2
-        )
+            / (1.0 + s)
+            * math.pi
+            * 0.5
+        ).pow(2)
 
         alpha_bar = (
             alpha_bar
@@ -784,30 +791,39 @@ def get_beta_schedule(
         )
 
         return betas.clamp(
-            min=1e-4,
-            max=0.9999,
+            1e-5,
+            0.999,
         )
 
     raise ValueError(
-        f"Неизвестное расписание: "
-        f"{schedule!r}"
+        f"Неизвестное расписание: {schedule!r}"
     )
+
+
+# ============================================================================
+# Tensor helpers
+# ============================================================================
 
 
 def extract(
     arr: torch.Tensor,
     t: torch.Tensor,
-    shape: tuple,
+    shape: tuple | torch.Size,
 ) -> torch.Tensor:
     """
-    Извлекает значения arr по индексам t.
+    Извлекает arr[t] и приводит к форме:
 
-    Все операции выполняются на device
-    текущего batch.
+        (B, 1, 1, 1)
+
+    для изображения.
     """
 
-    if arr.device != t.device:
-        arr = arr.to(t.device)
+    if t.dtype != torch.long:
+        t = t.long()
+
+    arr = arr.to(
+        device=t.device,
+    )
 
     out = arr.gather(
         0,
@@ -816,29 +832,31 @@ def extract(
 
     return out.reshape(
         t.shape[0],
-        *((1,) * (len(shape) - 1)),
+        *(
+            1
+            for _ in range(
+                len(shape) - 1
+            )
+        ),
     )
+
+
+# ============================================================================
+# DDPM
+# ============================================================================
 
 
 class DDPM:
     """
-    Обёртка над UNet, реализующая forward
-    и reverse diffusion.
+    DDPM wrapper.
 
-    ВАЖНО:
+    Поддерживает:
 
-    DDPM не перемещает модель на device.
-
-    Это позволяет безопасно использовать:
-
-        UNet -> DDP -> DDPM
-
-    вместо:
-
-        UNet -> DDP -> DDPM.to(device)
-
-    Device модели должен контролироваться
-    train.py.
+    - q_sample()
+    - loss_fn()
+    - p_sample()
+    - sample()
+    - ddim_sample()
     """
 
     def __init__(
@@ -846,25 +864,23 @@ class DDPM:
         model: nn.Module,
         timesteps: int = 1000,
         schedule: str = "cosine",
-        device: str = "cuda",
+        device: str | torch.device = "cuda",
     ):
-        if timesteps < 2:
-            raise ValueError(
-                "timesteps должен быть >= 2."
-            )
-
-        self.model = model
         self.device = torch.device(
             device
         )
+
+        self.model = model.to(
+            self.device
+        )
+
         self.timesteps = timesteps
+        self.schedule = schedule
 
         betas = get_beta_schedule(
             timesteps,
             schedule,
-        ).to(
-            self.device
-        )
+        ).to(self.device)
 
         self.betas = betas
 
@@ -879,12 +895,10 @@ class DDPM:
             )
         )
 
-        self.alphas_cumprod_prev = (
-            F.pad(
-                self.alphas_cumprod[:-1],
-                (1, 0),
-                value=1.0,
-            )
+        self.alphas_cumprod_prev = F.pad(
+            self.alphas_cumprod[:-1],
+            (1, 0),
+            value=1.0,
         )
 
         self.sqrt_alphas_cumprod = (
@@ -900,6 +914,12 @@ class DDPM:
             )
         )
 
+        self.sqrt_recip_alphas = (
+            torch.sqrt(
+                1.0 / self.alphas
+            )
+        )
+
         self.posterior_variance = (
             betas
             * (
@@ -911,6 +931,41 @@ class DDPM:
                 - self.alphas_cumprod
             )
         )
+
+        self.posterior_variance = (
+            self.posterior_variance.clamp(
+                min=1e-20
+            )
+        )
+
+        self.posterior_mean_coef1 = (
+            betas
+            * torch.sqrt(
+                self.alphas_cumprod_prev
+            )
+            / (
+                1.0
+                - self.alphas_cumprod
+            )
+        )
+
+        self.posterior_mean_coef2 = (
+            (
+                1.0
+                - self.alphas_cumprod_prev
+            )
+            * torch.sqrt(
+                self.alphas
+            )
+            / (
+                1.0
+                - self.alphas_cumprod
+            )
+        )
+
+    # ========================================================================
+    # Forward diffusion
+    # ========================================================================
 
     def q_sample(
         self,
@@ -924,14 +979,9 @@ class DDPM:
         torch.Tensor,
     ]:
         """
-        Forward process:
+        q(x_t | x_0).
 
-            q(x_t | x_0)
-            =
-            N(
-                sqrt(alpha_bar_t) * x_0,
-                (1 - alpha_bar_t) * I
-            )
+        x_0 -> x_t.
         """
 
         if noise is None:
@@ -958,22 +1008,24 @@ class DDPM:
 
         return x_t, noise
 
+    # ========================================================================
+    # Training loss
+    # ========================================================================
+
     def loss_fn(
         self,
         x_0: torch.Tensor,
     ) -> torch.Tensor:
         """
-        DDPM noise prediction loss.
+        Standard epsilon-prediction DDPM loss.
         """
 
-        batch_size = x_0.size(0)
+        batch_size = x_0.shape[0]
 
         t = torch.randint(
             0,
             self.timesteps,
-            (
-                batch_size,
-            ),
+            (batch_size,),
             device=x_0.device,
             dtype=torch.long,
         )
@@ -993,6 +1045,10 @@ class DDPM:
             noise,
         )
 
+    # ========================================================================
+    # DDPM reverse process
+    # ========================================================================
+
     @torch.no_grad()
     def p_sample(
         self,
@@ -1000,67 +1056,90 @@ class DDPM:
         t_idx: int,
     ) -> torch.Tensor:
         """
-        Один шаг обратного процесса:
+        Один шаг:
 
-            p_theta(x_{t-1} | x_t)
+            x_t -> x_{t-1}
+
+        через DDPM posterior.
         """
 
-        t_tensor = torch.full(
-            (
-                x.shape[0],
-            ),
+        batch_size = x.shape[0]
+
+        t = torch.full(
+            (batch_size,),
             t_idx,
-            dtype=torch.long,
             device=x.device,
+            dtype=torch.long,
         )
 
         noise_pred = self.model(
             x,
-            t_tensor,
+            t,
         )
 
         alpha = extract(
             self.alphas,
-            t_tensor,
+            t,
             x.shape,
         )
 
-        betas_t = extract(
+        alpha_bar = extract(
+            self.alphas_cumprod,
+            t,
+            x.shape,
+        )
+
+        beta = extract(
             self.betas,
-            t_tensor,
+            t,
             x.shape,
         )
 
         sqrt_one_minus_alpha_bar = (
             extract(
                 self.sqrt_one_minus_alphas_cumprod,
-                t_tensor,
+                t,
                 x.shape,
             )
         )
 
-        sqrt_recip_alpha = (
-            torch.rsqrt(alpha)
+        # Predicted x0.
+        x0_pred = (
+            x
+            - sqrt_one_minus_alpha_bar
+            * noise_pred
+        ) / torch.sqrt(
+            alpha_bar
         )
 
-        mean = (
-            sqrt_recip_alpha
-            * (
-                x
-                - (
-                    betas_t
-                    / sqrt_one_minus_alpha_bar
-                )
-                * noise_pred
-            )
+        x0_pred = x0_pred.clamp(
+            -1.0,
+            1.0,
+        )
+
+        coef1 = extract(
+            self.posterior_mean_coef1,
+            t,
+            x.shape,
+        )
+
+        coef2 = extract(
+            self.posterior_mean_coef2,
+            t,
+            x.shape,
+        )
+
+        posterior_mean = (
+            coef1 * x0_pred
+            + coef2 * x
         )
 
         if t_idx == 0:
-            return mean
+            return posterior_mean
 
-        posterior_variance = extract(
+        variance = extract(
             self.posterior_variance,
-            t_tensor,
+            t,
             x.shape,
         )
 
@@ -1069,10 +1148,16 @@ class DDPM:
         )
 
         return (
-            mean
-            + posterior_variance.sqrt()
+            posterior_mean
+            + torch.sqrt(
+                variance
+            )
             * noise
         )
+
+    # ========================================================================
+    # DDPM sampling
+    # ========================================================================
 
     @torch.no_grad()
     def sample(
@@ -1084,24 +1169,32 @@ class DDPM:
             128,
         ),
         verbose: bool = False,
+        device: str | torch.device | None = None,
     ) -> torch.Tensor:
         """
-        Полная генерация:
+        Полная DDPM генерация.
 
-            x_T ~ N(0, I)
-            x_T -> ... -> x_0
+        Возвращает tensor в [-1, 1].
         """
+
+        sample_device = (
+            torch.device(device)
+            if device is not None
+            else self.device
+        )
+
+        self.model.eval()
 
         x = torch.randn(
             n,
             *img_shape,
-            device=self.device,
+            device=sample_device,
         )
 
-        steps = reversed(
-            range(
-                self.timesteps
-            )
+        steps = range(
+            self.timesteps - 1,
+            -1,
+            -1,
         )
 
         if verbose:
@@ -1110,7 +1203,8 @@ class DDPM:
 
                 steps = tqdm(
                     steps,
-                    desc="Sampling",
+                    total=self.timesteps,
+                    desc="DDPM Sampling",
                 )
             except ImportError:
                 pass
@@ -1118,13 +1212,222 @@ class DDPM:
         for t_idx in steps:
             x = self.p_sample(
                 x,
-                t_idx,
+                int(t_idx),
             )
 
         return x.clamp(
-            -1,
-            1,
+            -1.0,
+            1.0,
         )
+
+    # ========================================================================
+    # DDIM sampling
+    # ========================================================================
+
+    @torch.no_grad()
+    def ddim_sample(
+        self,
+        n: int = 16,
+        img_shape: tuple = (
+            3,
+            128,
+            128,
+        ),
+        sampling_steps: int = 50,
+        eta: float = 0.0,
+        verbose: bool = False,
+        device: str | torch.device | None = None,
+    ) -> torch.Tensor:
+        """
+        DDIM sampling.
+
+        sampling_steps=50 значительно быстрее
+        полного DDPM sampling с T=1000.
+
+        eta=0:
+            deterministic DDIM.
+
+        eta=1:
+            stochastic DDIM.
+        """
+
+        if sampling_steps <= 0:
+            raise ValueError(
+                "sampling_steps должен быть > 0."
+            )
+
+        if sampling_steps > self.timesteps:
+            raise ValueError(
+                "sampling_steps не может быть "
+                "больше timesteps."
+            )
+
+        sample_device = (
+            torch.device(device)
+            if device is not None
+            else self.device
+        )
+
+        self.model.eval()
+
+        x = torch.randn(
+            n,
+            *img_shape,
+            device=sample_device,
+        )
+
+        timesteps = torch.linspace(
+            0,
+            self.timesteps - 1,
+            sampling_steps,
+            device=sample_device,
+        ).round().long()
+
+        timesteps = torch.unique(
+            timesteps
+        )
+
+        timesteps = timesteps.flip(
+            0
+        )
+
+        if verbose:
+            try:
+                from tqdm import tqdm
+
+                timesteps = tqdm(
+                    timesteps,
+                    desc="DDIM Sampling",
+                )
+            except ImportError:
+                pass
+
+        for index, t_idx_tensor in enumerate(
+            timesteps
+        ):
+            t_idx = int(
+                t_idx_tensor.item()
+            )
+
+            t = torch.full(
+                (n,),
+                t_idx,
+                device=sample_device,
+                dtype=torch.long,
+            )
+
+            noise_pred = self.model(
+                x,
+                t,
+            )
+
+            alpha_bar = extract(
+                self.alphas_cumprod,
+                t,
+                x.shape,
+            )
+
+            sqrt_alpha_bar = torch.sqrt(
+                alpha_bar
+            )
+
+            sqrt_one_minus_alpha_bar = (
+                torch.sqrt(
+                    1.0
+                    - alpha_bar
+                )
+            )
+
+            x0_pred = (
+                x
+                - sqrt_one_minus_alpha_bar
+                * noise_pred
+            ) / sqrt_alpha_bar
+
+            x0_pred = x0_pred.clamp(
+                -1.0,
+                1.0,
+            )
+
+            if index == len(
+                timesteps
+            ) - 1:
+                alpha_bar_prev = torch.ones_like(
+                    alpha_bar
+                )
+            else:
+                prev_t = int(
+                    timesteps[
+                        index + 1
+                    ].item()
+                )
+
+                prev_t_tensor = torch.full(
+                    (n,),
+                    prev_t,
+                    device=sample_device,
+                    dtype=torch.long,
+                )
+
+                alpha_bar_prev = extract(
+                    self.alphas_cumprod,
+                    prev_t_tensor,
+                    x.shape,
+                )
+
+            sigma = (
+                eta
+                * torch.sqrt(
+                    (
+                        1.0
+                        - alpha_bar_prev
+                    )
+                    / (
+                        1.0
+                        - alpha_bar
+                    )
+                )
+                * torch.sqrt(
+                    1.0
+                    - alpha_bar
+                    / alpha_bar_prev
+                )
+            )
+
+            direction = torch.sqrt(
+                (
+                    1.0
+                    - alpha_bar_prev
+                    - sigma.pow(2)
+                ).clamp(
+                    min=0.0
+                )
+            ) * noise_pred
+
+            noise = (
+                torch.randn_like(x)
+                if eta > 0
+                else torch.zeros_like(x)
+            )
+
+            x = (
+                torch.sqrt(
+                    alpha_bar_prev
+                )
+                * x0_pred
+                + direction
+                + sigma * noise
+            )
+
+        return x.clamp(
+            -1.0,
+            1.0,
+        )
+
+
+# ============================================================================
+# Smoke test
+# ============================================================================
 
 
 if __name__ == "__main__":
@@ -1140,12 +1443,13 @@ if __name__ == "__main__":
 
     model = UNet(
         img_channels=3,
-        base_channels=64,
-        time_emb_dim=256,
+        base_channels=32,
+        time_emb_dim=128,
+        dropout=0.1,
     ).to(device)
 
     ddpm = DDPM(
-        model=model,
+        model,
         timesteps=100,
         schedule="cosine",
         device=device,
@@ -1162,9 +1466,7 @@ if __name__ == "__main__":
     t = torch.randint(
         0,
         100,
-        (
-            2,
-        ),
+        (2,),
         device=device,
     )
 
@@ -1174,28 +1476,25 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Input: {x.shape}"
+        f"Input: {tuple(x.shape)}"
     )
 
     print(
-        f"Pred:  {pred.shape}"
+        f"Pred:  {tuple(pred.shape)}"
     )
 
-    loss = ddpm.loss_fn(
-        x
-    )
+    loss = ddpm.loss_fn(x)
 
     print(
-        f"Loss:  {loss.item():.4f}"
+        f"Loss: {loss.item():.4f}"
     )
 
     n_params = sum(
-        parameter.numel()
-        for parameter in model.parameters()
+        p.numel()
+        for p in model.parameters()
     )
 
     print(
-        f"Параметров: "
-        f"{n_params:,} "
-        f"({n_params / 1e6:.2f}M)"
+        f"Параметров: {n_params:,}"
+        f" ({n_params / 1e6:.2f}M)"
     )
