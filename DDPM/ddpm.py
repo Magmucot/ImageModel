@@ -10,6 +10,7 @@ DDPM (Denoising Diffusion Probabilistic Models)
   - Косинусное beta-расписание.
   - Корректный posterior variance.
   - Все timestep tensors создаются на device текущего batch.
+  - Совместимость с single-GPU и DistributedDataParallel.
 """
 
 from __future__ import annotations
@@ -33,20 +34,18 @@ class SinusoidalPositionEmbeddings(nn.Module):
     ):
         super().__init__()
 
+        if dim < 4:
+            raise ValueError(
+                "time_emb_dim должен быть >= 4."
+            )
+
         self.dim = dim
 
     def forward(
         self,
         t: torch.Tensor,
     ) -> torch.Tensor:
-        device = t.device
-
         half_dim = self.dim // 2
-
-        if half_dim < 2:
-            raise ValueError(
-                "time_emb_dim должен быть >= 4."
-            )
 
         exponent = (
             math.log(10000)
@@ -56,7 +55,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = torch.exp(
             torch.arange(
                 half_dim,
-                device=device,
+                device=t.device,
                 dtype=torch.float32,
             )
             * -exponent
@@ -185,12 +184,9 @@ class SelfAttention2d(nn.Module):
     """
     Multi-head self-attention для feature map.
 
-    Используется только на небольших spatial resolution:
+    Используется на небольших spatial resolution:
         16×16
         8×8
-
-    Это существенно снижает потребление VRAM по сравнению
-    с attention на 32×32.
     """
 
     def __init__(
@@ -487,9 +483,6 @@ class UNet(nn.Module):
          32×32   base*4
          16×16   base*8 + attention
           8×8    base*8 + attention
-
-    Attention специально отсутствует на 32×32,
-    поскольку attention имеет O((H*W)^2) сложность.
     """
 
     def __init__(
@@ -500,6 +493,11 @@ class UNet(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+
+        if base_channels < 8:
+            raise ValueError(
+                "base_channels должен быть >= 8."
+            )
 
         ch = base_channels
 
@@ -546,11 +544,10 @@ class UNet(nn.Module):
 
         # 32 -> 16
         #
-        # ВАЖНО:
-        # attention здесь применяется после ResNet,
-        # пока resolution ещё 32×32.
-        #
-        # Поэтому attention отключён.
+        # Attention здесь выключен,
+        # потому что DownBlock применяет
+        # attention до downsample, то есть
+        # на resolution 32×32.
         self.down3 = DownBlock(
             ch * 4,
             ch * 8,
@@ -561,7 +558,7 @@ class UNet(nn.Module):
 
         # 16 -> 8
         #
-        # Здесь attention работает на 16×16.
+        # Attention работает на 16×16.
         self.down4 = DownBlock(
             ch * 8,
             ch * 8,
@@ -589,6 +586,8 @@ class UNet(nn.Module):
         )
 
         # 8 -> 16
+        #
+        # Attention работает на 16×16.
         self.up4 = UpBlock(
             ch * 8,
             ch * 8,
@@ -599,9 +598,6 @@ class UNet(nn.Module):
         )
 
         # 16 -> 32
-        #
-        # После up3 resolution 32×32.
-        # Attention здесь отключаем.
         self.up3 = UpBlock(
             ch * 8,
             ch * 8,
@@ -724,12 +720,25 @@ def get_beta_schedule(
     beta_end: float = 0.02,
 ) -> torch.Tensor:
     """
-    Создаёт beta schedule.
+    Возвращает beta schedule.
+
+    Args:
+        timesteps:
+            Количество diffusion steps.
+
+        schedule:
+            "cosine" или "linear".
+
+        beta_start:
+            Начальное beta для linear.
+
+        beta_end:
+            Конечное beta для linear.
     """
 
-    if timesteps <= 0:
+    if timesteps < 2:
         raise ValueError(
-            "timesteps должен быть > 0."
+            "timesteps должен быть >= 2."
         )
 
     if schedule == "linear":
@@ -737,7 +746,6 @@ def get_beta_schedule(
             beta_start,
             beta_end,
             timesteps,
-            dtype=torch.float32,
         )
 
     if schedule == "cosine":
@@ -752,14 +760,18 @@ def get_beta_schedule(
             dtype=torch.float32,
         )
 
-        alpha_bar = torch.cos(
-            (
-                x / timesteps + s
+        alpha_bar = (
+            torch.cos(
+                (
+                    (x / timesteps)
+                    + s
+                )
+                / (1 + s)
+                * math.pi
+                * 0.5
             )
-            / (1 + s)
-            * math.pi
-            * 0.5
-        ) ** 2
+            ** 2
+        )
 
         alpha_bar = (
             alpha_bar
@@ -772,8 +784,8 @@ def get_beta_schedule(
         )
 
         return betas.clamp(
-            1e-4,
-            0.9999,
+            min=1e-4,
+            max=0.9999,
         )
 
     raise ValueError(
@@ -788,22 +800,21 @@ def extract(
     shape: tuple,
 ) -> torch.Tensor:
     """
-    Извлекает коэффициенты по timestep.
+    Извлекает значения arr по индексам t.
 
-    Все вычисления выполняются на device t.
+    Все операции выполняются на device
+    текущего batch.
     """
 
-    arr = arr.to(
-        device=t.device,
-        dtype=torch.float32,
-    )
+    if arr.device != t.device:
+        arr = arr.to(t.device)
 
-    values = arr.gather(
+    out = arr.gather(
         0,
         t,
     )
 
-    return values.reshape(
+    return out.reshape(
         t.shape[0],
         *((1,) * (len(shape) - 1)),
     )
@@ -811,37 +822,42 @@ def extract(
 
 class DDPM:
     """
-    Реализация DDPM.
+    Обёртка над UNet, реализующая forward
+    и reverse diffusion.
 
-    q_sample:
-        x0 -> xt
+    ВАЖНО:
 
-    loss_fn:
-        MSE(predicted_noise, noise)
+    DDPM не перемещает модель на device.
 
-    p_sample:
-        xt -> xt-1
+    Это позволяет безопасно использовать:
 
-    sample:
-        xT -> x0
+        UNet -> DDP -> DDPM
+
+    вместо:
+
+        UNet -> DDP -> DDPM.to(device)
+
+    Device модели должен контролироваться
+    train.py.
     """
 
     def __init__(
         self,
-        model: UNet,
+        model: nn.Module,
         timesteps: int = 1000,
         schedule: str = "cosine",
         device: str = "cuda",
     ):
+        if timesteps < 2:
+            raise ValueError(
+                "timesteps должен быть >= 2."
+            )
+
         self.model = model
         self.device = torch.device(
             device
         )
         self.timesteps = timesteps
-
-        self.model.to(
-            self.device
-        )
 
         betas = get_beta_schedule(
             timesteps,
@@ -863,10 +879,12 @@ class DDPM:
             )
         )
 
-        self.alphas_cumprod_prev = F.pad(
-            self.alphas_cumprod[:-1],
-            (1, 0),
-            value=1.0,
+        self.alphas_cumprod_prev = (
+            F.pad(
+                self.alphas_cumprod[:-1],
+                (1, 0),
+                value=1.0,
+            )
         )
 
         self.sqrt_alphas_cumprod = (
@@ -906,7 +924,14 @@ class DDPM:
         torch.Tensor,
     ]:
         """
-        q(x_t | x_0).
+        Forward process:
+
+            q(x_t | x_0)
+            =
+            N(
+                sqrt(alpha_bar_t) * x_0,
+                (1 - alpha_bar_t) * I
+            )
         """
 
         if noise is None:
@@ -938,7 +963,7 @@ class DDPM:
         x_0: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Standard DDPM noise prediction loss.
+        DDPM noise prediction loss.
         """
 
         batch_size = x_0.size(0)
@@ -975,7 +1000,9 @@ class DDPM:
         t_idx: int,
     ) -> torch.Tensor:
         """
-        Один шаг reverse diffusion.
+        Один шаг обратного процесса:
+
+            p_theta(x_{t-1} | x_t)
         """
 
         t_tensor = torch.full(
@@ -998,14 +1025,8 @@ class DDPM:
             x.shape,
         )
 
-        beta = extract(
+        betas_t = extract(
             self.betas,
-            t_tensor,
-            x.shape,
-        )
-
-        alpha_bar = extract(
-            self.alphas_cumprod,
             t_tensor,
             x.shape,
         )
@@ -1018,8 +1039,8 @@ class DDPM:
             )
         )
 
-        sqrt_recip_alpha = torch.rsqrt(
-            alpha
+        sqrt_recip_alpha = (
+            torch.rsqrt(alpha)
         )
 
         mean = (
@@ -1027,7 +1048,7 @@ class DDPM:
             * (
                 x
                 - (
-                    beta
+                    betas_t
                     / sqrt_one_minus_alpha_bar
                 )
                 * noise_pred
@@ -1065,10 +1086,11 @@ class DDPM:
         verbose: bool = False,
     ) -> torch.Tensor:
         """
-        Полная генерация xT -> x0.
-        """
+        Полная генерация:
 
-        self.model.eval()
+            x_T ~ N(0, I)
+            x_T -> ... -> x_0
+        """
 
         x = torch.randn(
             n,
@@ -1076,10 +1098,10 @@ class DDPM:
             device=self.device,
         )
 
-        steps = range(
-            self.timesteps - 1,
-            -1,
-            -1,
+        steps = reversed(
+            range(
+                self.timesteps
+            )
         )
 
         if verbose:
@@ -1123,7 +1145,7 @@ if __name__ == "__main__":
     ).to(device)
 
     ddpm = DDPM(
-        model,
+        model=model,
         timesteps=100,
         schedule="cosine",
         device=device,
@@ -1164,12 +1186,12 @@ if __name__ == "__main__":
     )
 
     print(
-        f"Loss: {loss.item():.4f}"
+        f"Loss:  {loss.item():.4f}"
     )
 
     n_params = sum(
-        p.numel()
-        for p in model.parameters()
+        parameter.numel()
+        for parameter in model.parameters()
     )
 
     print(
