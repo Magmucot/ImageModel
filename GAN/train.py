@@ -248,8 +248,12 @@ def main():
     start_epoch = 1
     if args.resume:
         ckpt = load_checkpoint(args.resume, device=str(device))
-        G.load_state_dict(ckpt["G"])
-        D.load_state_dict(ckpt["D"])
+        G_base = G.module if isinstance(G, nn.DataParallel) else G
+        D_base = D.module if isinstance(D, nn.DataParallel) else D
+
+        G_base.load_state_dict(ckpt["G"])
+        D_base.load_state_dict(ckpt["D"])
+
         opt_g.load_state_dict(ckpt["opt_g"])
         opt_d.load_state_dict(ckpt["opt_d"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -297,9 +301,16 @@ def main():
         if epoch % args.save_every == 0 or epoch == args.epochs:
             save_checkpoint(
                 {
-                    "epoch": epoch, "G": G.state_dict(), "D": D.state_dict(),
-                    "opt_g": opt_g.state_dict(), "opt_d": opt_d.state_dict(),
-                    "args":  vars(args),
+                    "epoch": epoch,
+                    "G": G.module.state_dict()
+                    if isinstance(G, nn.DataParallel)
+                    else G.state_dict(),
+                    "D": D.module.state_dict()
+                    if isinstance(D, nn.DataParallel)
+                    else D.state_dict(),
+                    "opt_g": opt_g.state_dict(),
+                    "opt_d": opt_d.state_dict(),
+                    "args": vars(args),
                 },
                 args.output_dir,
                 filename=f"checkpoint_ep{epoch:03d}.pt",

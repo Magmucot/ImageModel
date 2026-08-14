@@ -196,7 +196,11 @@ def train_epoch(
 
         # Обновляем EMA после каждого шага
         if ema is not None:
-            ema.update(ddpm.model)
+            ema.update(
+            ddpm.model.module
+            if isinstance(ddpm.model, torch.nn.DataParallel)
+            else ddpm.model
+        )
 
         loss_acc += loss.item()
 
@@ -243,18 +247,27 @@ def main():
         )
 
     # ── Модель ────────────────────────────────────────────────────────────────
-    unet = UNet(
+    base_unet = UNet(
         img_channels=3,
         base_channels=args.base_channels,
         time_emb_dim=args.time_emb_dim,
         dropout=args.dropout,
+    ).to(device)
+
+    unet = (
+        torch.nn.DataParallel(base_unet)
+        if use_multi_gpu
+        else base_unet
     )
+
     ddpm = DDPM(
         model=unet,
         timesteps=args.timesteps,
         schedule=args.schedule,
         device=str(device),
     )
+
+ema = EMA(base_unet, decay=args.ema_decay) if args.ema_decay > 0 else None
     print_model_info(
         unet,
         f"UNet DDPM  (base_ch={args.base_channels}, T={args.timesteps}, {args.schedule})",
@@ -275,7 +288,13 @@ def main():
     best_loss   = float("inf")
     if args.resume:
         ckpt = load_checkpoint(args.resume, device=str(device))
-        unet.load_state_dict(ckpt["model"])
+        base_unet = (
+            unet.module
+            if isinstance(unet, torch.nn.DataParallel)
+            else unet
+        )
+
+        base_unet.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if ema and "ema" in ckpt:
             ema.load_state_dict(ckpt["ema"])
@@ -335,7 +354,11 @@ def main():
         if epoch % args.save_every == 0 or epoch == args.epochs:
             state = {
                 "epoch":     epoch,
-                "model":     unet.state_dict(),
+                "model": (
+                            unet.module.state_dict()
+                            if isinstance(unet, torch.nn.DataParallel)
+                            else unet.state_dict()
+                        ),
                 "optimizer": optimizer.state_dict(),
                 "best_loss": best_loss,
                 "args":      vars(args),
