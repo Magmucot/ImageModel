@@ -267,7 +267,7 @@ def main():
         device=str(device),
     )
 
-ema = EMA(base_unet, decay=args.ema_decay) if args.ema_decay > 0 else None
+    ema = EMA(base_unet, decay=args.ema_decay) if args.ema_decay > 0 else None
     print_model_info(
         unet,
         f"UNet DDPM  (base_ch={args.base_channels}, T={args.timesteps}, {args.schedule})",
