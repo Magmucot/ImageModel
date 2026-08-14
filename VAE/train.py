@@ -253,7 +253,14 @@ def main():
         )
 
     # ── Модель ────────────────────────────────────────────────────────────────
-    model = VAE(latent_dim=args.latent_dim, beta=args.beta).to(device)
+    model = VAE(
+        latent_dim=args.latent_dim,
+        beta=args.beta,
+    ).to(device)
+
+    if use_multi_gpu:
+        model = torch.nn.DataParallel(model)
+
     print_model_info(model, f"β-VAE  (latent_dim={args.latent_dim}, β={args.beta})")
 
     # ── Оптимизатор + Scheduler ───────────────────────────────────────────────
@@ -307,7 +314,11 @@ def main():
         if epoch % args.save_every == 0 or epoch == args.epochs:
             state = {
                 "epoch":     epoch,
-                "model":     model.state_dict(),
+                "model": (
+                            model.module.state_dict()
+                            if isinstance(model, torch.nn.DataParallel)
+                            else model.state_dict()
+                        ),  
                 "optimizer": optimizer.state_dict(),
                 "best_val":  best_val,
                 "args":      vars(args),
@@ -322,7 +333,16 @@ def main():
         if epoch % args.sample_every == 0 or epoch == args.epochs:
             with torch.no_grad():
                 # Сгенерированные из латентного пространства
-                samples = model.sample(n=args.n_samples, device=str(device))
+                model_base = (
+                    model.module
+                    if isinstance(model, torch.nn.DataParallel)
+                    else model
+                )
+
+                samples = model_base.sample(
+                    n=args.n_samples,
+                    device=str(device),
+                )
                 save_sample_grid(
                     samples,
                     path=f"{args.output_dir}/samples/gen_ep{epoch:03d}.png",
@@ -348,7 +368,16 @@ def main():
 
     # ── Финальный постер ──────────────────────────────────────────────────────
     with torch.no_grad():
-        final_samples = model.sample(n=args.n_samples, device=str(device))
+        model_base = (
+            model.module
+            if isinstance(model, torch.nn.DataParallel)
+            else model
+        )
+
+        final_samples = model_base.sample(
+            n=args.n_samples,
+            device=str(device),
+        )
     vis.plot_final_summary(
         logger.epoch_history,
         samples=final_samples,

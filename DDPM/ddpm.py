@@ -360,7 +360,7 @@ def extract(
     shape: (B, C, H, W) — целевая форма
     Returns: (B, 1, 1, 1) для broadcast с изображением
     """
-    out = arr.gather(-1, t)
+    out = arr.gather(-1, t.cpu()).to(t.device)
     return out.reshape(t.shape[0], *((1,) * (len(shape) - 1)))
 
 
