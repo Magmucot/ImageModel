@@ -1,333 +1,760 @@
 """
-Скрипт обучения DCGAN (Spectral Norm + Self-Attention) на FFHQ 128×128.
+Обучение DCGAN.
 
-Запуск:
-    python GAN/train.py --data_root ./data --epochs 100 --batch_size 32
-    python GAN/train.py --config configs/gan.yaml
-    python GAN/train.py --resume checkpoints/gan/checkpoint_ep050.pt
+Single GPU:
 
-Опции:
-    --dry_run   — 2 мини-эпохи без реальных данных (для проверки кода)
+    python GAN/train.py \
+        --config configs/gan.yaml
 
-Особенности:
-  - Label smoothing: реальные метки [0.9, 1.0], фейковые [0.0, 0.1]
-  - Сохраняет D_loss, G_loss, D(x), D(G(z)) в CSV
-  - Предупреждает о возможном mode collapse (D(x) ≈ 0 или G слишком слаб)
+Multi GPU:
+
+    torchrun --standalone \
+        --nproc_per_node=4 \
+        GAN/train.py \
+        --config configs/gan.yaml
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import argparse
-import yaml
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import yaml
 
-from GAN.gan import Generator, Discriminator, weights_init, smooth_labels
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from GAN.gan import (
+    Discriminator,
+    Generator,
+    smooth_labels,
+    weights_init,
+)
+from utils.distributed import (
+    cleanup_distributed,
+    is_main_process,
+    reduce_mean,
+    seed_everything,
+    setup_distributed,
+    unwrap_model,
+    wrap_ddp,
+)
 from utils.utils import (
-    TrainingLogger, Visualizer,
-    save_checkpoint, load_checkpoint,
-    save_sample_grid, print_model_info,
+    TrainingLogger,
+    Visualizer,
+    load_checkpoint,
+    print_model_info,
+    save_checkpoint,
+    save_sample_grid,
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Аргументы
-# ─────────────────────────────────────────────────────────────────────────────
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DCGAN Training on FFHQ 128×128")
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return yaml.safe_load(file) or {}
 
-    parser.add_argument("--config",      type=str,   default="configs/gan.yaml")
-    parser.add_argument("--data_root",   type=str,   default="./data")
-    parser.add_argument("--val_frac",    type=float, default=0.05)
-    parser.add_argument("--num_workers", type=int,   default=4)
 
-    parser.add_argument("--latent_dim",  type=int,   default=100)
-    parser.add_argument("--ngf",         type=int,   default=64)
-    parser.add_argument("--ndf",         type=int,   default=64)
+def get_config_value(
+    config: dict,
+    key: str,
+    default,
+):
+    for section in config.values():
+        if not isinstance(section, dict):
+            continue
 
-    parser.add_argument("--epochs",      type=int,   default=100)
-    parser.add_argument("--batch_size",  type=int,   default=32)
-    parser.add_argument("--lr_g",        type=float, default=2e-4)
-    parser.add_argument("--lr_d",        type=float, default=2e-4)
-    parser.add_argument("--beta1",       type=float, default=0.5)
-    parser.add_argument("--beta2",       type=float, default=0.999)
-    parser.add_argument("--label_smooth",type=float, default=0.1)
-    parser.add_argument("--n_critic",    type=int,   default=1,
-                        help="шагов D на 1 шаг G")
+        if key in section:
+            return section[key]
 
-    parser.add_argument("--output_dir",  type=str,   default="checkpoints/gan")
-    parser.add_argument("--save_every",  type=int,   default=10)
-    parser.add_argument("--sample_every",type=int,   default=5)
-    parser.add_argument("--log_every",   type=int,   default=20)
-    parser.add_argument("--n_samples",   type=int,   default=64)
+    return default
 
-    parser.add_argument("--device",      type=str,   default="auto")
-    parser.add_argument("--resume",      type=str,   default=None)
-    parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--dry_run",     action="store_true")
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--config",
+        default="configs/gan.yaml",
+    )
+
+    parser.add_argument(
+        "--data_root",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--val_frac",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--pin_memory",
+        type=lambda x: x.lower() == "true",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--ngf",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--ndf",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--lr_g",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--lr_d",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--beta1",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--beta2",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--label_smooth",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--n_critic",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--sample_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--n_samples",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--device",
+        default="auto",
+    )
+
+    parser.add_argument(
+        "--resume",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
-    if os.path.exists(args.config):
-        with open(args.config, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        for section in cfg.values():
-            if isinstance(section, dict):
-                for k, v in section.items():
-                    if hasattr(args, k) and getattr(args, k) == parser.get_default(k):
-                        setattr(args, k, v)
+    config = load_config(
+        args.config
+    )
+
+    defaults = {
+        "data_root": "./data",
+        "val_frac": 0.05,
+        "num_workers": 4,
+        "pin_memory": True,
+        "latent_dim": 100,
+        "ngf": 64,
+        "ndf": 64,
+        "epochs": 100,
+        "batch_size": 32,
+        "lr_g": 2e-4,
+        "lr_d": 2e-4,
+        "beta1": 0.5,
+        "beta2": 0.999,
+        "label_smooth": 0.1,
+        "n_critic": 1,
+        "output_dir": "checkpoints/gan",
+        "save_every": 10,
+        "sample_every": 5,
+        "log_every": 20,
+        "n_samples": 64,
+        "seed": 42,
+    }
+
+    for key, default in defaults.items():
+        if getattr(args, key) is None:
+            setattr(
+                args,
+                key,
+                get_config_value(
+                    config,
+                    key,
+                    default,
+                ),
+            )
 
     return args
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Синтетический DataLoader для dry_run
-# ─────────────────────────────────────────────────────────────────────────────
-
 class DummyDataLoader:
-    def __init__(self, batch_size=8, n_batches=10):
+    def __init__(
+        self,
+        batch_size,
+        n_batches=10,
+    ):
         self.batch_size = batch_size
-        self.n_batches  = n_batches
+        self.n_batches = n_batches
 
-    def __len__(self): return self.n_batches
+    def __len__(self):
+        return self.n_batches
 
     def __iter__(self):
         for _ in range(self.n_batches):
-            yield torch.randn(self.batch_size, 3, 128, 128)
+            yield torch.randn(
+                self.batch_size,
+                3,
+                128,
+                128,
+            )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Эпоха обучения GAN
-# ─────────────────────────────────────────────────────────────────────────────
+def set_requires_grad(
+    model: torch.nn.Module,
+    value: bool,
+):
+    for parameter in model.parameters():
+        parameter.requires_grad_(value)
+
 
 def train_epoch(
-    G, D, loader,
-    opt_g: torch.optim.Optimizer,
-    opt_d: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    args: argparse.Namespace,
-    logger: TrainingLogger,
-    epoch: int,
-    fixed_noise: torch.Tensor,
-) -> dict:
-    G.train(); D.train()
+    generator,
+    discriminator,
+    loader,
+    optimizer_g,
+    optimizer_d,
+    criterion,
+    device,
+    args,
+    logger,
+    epoch,
+):
+    generator.train()
+    discriminator.train()
 
-    d_loss_acc = g_loss_acc = 0.0
-    dx_acc     = dg_acc1    = dg_acc2 = 0.0
-    n_steps = 0
+    d_loss_sum = 0.0
+    g_loss_sum = 0.0
+    dx_sum = 0.0
+    dg1_sum = 0.0
+    dg2_sum = 0.0
+
+    steps = 0
 
     for step, real in enumerate(loader):
-        real = real.to(device, non_blocking=True)
-        B    = real.size(0)
-        dev  = str(device)
+        real = real.to(
+            device,
+            non_blocking=True,
+        )
 
-        # ── Обучение Discriminator ────────────────────────────────────────
+        batch_size = real.size(0)
+
+        # --------------------------------------------------------------
+        # Discriminator
+        # --------------------------------------------------------------
+
+        set_requires_grad(
+            discriminator,
+            True,
+        )
+
         for _ in range(args.n_critic):
-            D.zero_grad()
+            optimizer_d.zero_grad(
+                set_to_none=True
+            )
 
-            # Реальные изображения
-            real_labels = smooth_labels(B, real=True,  smooth=args.label_smooth, device=dev)
-            d_real = D(real)
-            loss_d_real = criterion(d_real, real_labels)
+            real_labels = smooth_labels(
+                batch_size,
+                real=True,
+                smooth=args.label_smooth,
+                device=str(device),
+            )
 
-            # Фейковые изображения
-            z = torch.randn(B, args.latent_dim, 1, 1, device=device)
-            fake = G(z).detach()
-            fake_labels = smooth_labels(B, real=False, smooth=args.label_smooth, device=dev)
-            d_fake = D(fake)
-            loss_d_fake = criterion(d_fake, fake_labels)
+            real_output = discriminator(
+                real
+            )
 
-            loss_d = (loss_d_real + loss_d_fake) * 0.5
-            loss_d.backward()
-            opt_d.step()
+            loss_real = criterion(
+                real_output,
+                real_labels,
+            )
 
-        # ── Обучение Generator ────────────────────────────────────────────
-        G.zero_grad()
-        z    = torch.randn(B, args.latent_dim, 1, 1, device=device)
-        fake = G(z)
-        # G хочет чтобы D считал фейки реальными
-        g_labels = torch.ones(B, device=device)
-        d_g_z2   = D(fake)
-        loss_g   = criterion(d_g_z2, g_labels)
-        loss_g.backward()
-        opt_g.step()
+            noise = torch.randn(
+                batch_size,
+                args.latent_dim,
+                1,
+                1,
+                device=device,
+            )
 
-        # Аккумуляция статистик
-        d_loss_acc += loss_d.item()
-        g_loss_acc += loss_g.item()
-        dx_acc     += d_real.mean().item()
-        dg_acc1    += d_fake.mean().item()
-        dg_acc2    += d_g_z2.mean().item()
-        n_steps    += 1
+            fake = generator(
+                noise
+            ).detach()
 
-        if (step + 1) % args.log_every == 0:
+            fake_labels = smooth_labels(
+                batch_size,
+                real=False,
+                smooth=args.label_smooth,
+                device=str(device),
+            )
+
+            fake_output = discriminator(
+                fake
+            )
+
+            loss_fake = criterion(
+                fake_output,
+                fake_labels,
+            )
+
+            d_loss = (
+                loss_real + loss_fake
+            ) * 0.5
+
+            d_loss.backward()
+            optimizer_d.step()
+
+        # --------------------------------------------------------------
+        # Generator
+        # --------------------------------------------------------------
+
+        set_requires_grad(
+            discriminator,
+            False,
+        )
+
+        optimizer_g.zero_grad(
+            set_to_none=True
+        )
+
+        noise = torch.randn(
+            batch_size,
+            args.latent_dim,
+            1,
+            1,
+            device=device,
+        )
+
+        fake = generator(noise)
+
+        labels = torch.ones(
+            batch_size,
+            device=device,
+        )
+
+        fake_output_for_g = discriminator(
+            fake
+        )
+
+        g_loss = criterion(
+            fake_output_for_g,
+            labels,
+        )
+
+        g_loss.backward()
+        optimizer_g.step()
+
+        set_requires_grad(
+            discriminator,
+            True,
+        )
+
+        d_loss_sum += d_loss.detach()
+        g_loss_sum += g_loss.detach()
+        dx_sum += real_output.detach().mean()
+        dg1_sum += fake_output.detach().mean()
+        dg2_sum += fake_output_for_g.detach().mean()
+
+        steps += 1
+
+        if (
+            is_main_process()
+            and (step + 1) % args.log_every == 0
+        ):
             logger.log(
-                epoch=epoch, step=step + 1,
-                d_loss=loss_d.item(), g_loss=loss_g.item(),
-                D_x=d_real.mean().item(), D_G_z1=d_fake.mean().item(),
-                D_G_z2=d_g_z2.mean().item(),
-            )
-            logger.print_step(
-                epoch, args.epochs, step + 1, len(loader),
-                D_loss=loss_d.item(), G_loss=loss_g.item(),
-                D_x=d_real.mean().item(), D_Gz=d_g_z2.mean().item(),
+                epoch=epoch,
+                step=step + 1,
+                d_loss=d_loss.item(),
+                g_loss=g_loss.item(),
+                D_x=real_output.mean().item(),
+                D_G_z1=fake_output.mean().item(),
+                D_G_z2=fake_output_for_g.mean().item(),
             )
 
-    n = max(n_steps, 1)
+    steps = max(steps, 1)
+
     return {
-        "d_loss":  d_loss_acc / n,
-        "g_loss":  g_loss_acc / n,
-        "D_x":     dx_acc     / n,
-        "D_G_z1":  dg_acc1    / n,
-        "D_G_z2":  dg_acc2    / n,
+        "d_loss": reduce_mean(
+            d_loss_sum / steps
+        ).item(),
+        "g_loss": reduce_mean(
+            g_loss_sum / steps
+        ).item(),
+        "D_x": reduce_mean(
+            dx_sum / steps
+        ).item(),
+        "D_G_z1": reduce_mean(
+            dg1_sum / steps
+        ).item(),
+        "D_G_z2": reduce_mean(
+            dg2_sum / steps
+        ).item(),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    device, local_rank, distributed = (
+        setup_distributed(
+            args.device
+        )
+    )
 
-    use_multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
+    seed_everything(
+        args.seed
+    )
 
-    if use_multi_gpu:
-        print(f"Using {torch.cuda.device_count()} GPUs")
-
-    # ── Данные ────────────────────────────────────────────────────────────────
-    if args.dry_run:
-        print("⚠️  DRY RUN — используются синтетические данные")
-        train_loader = DummyDataLoader(batch_size=args.batch_size, n_batches=10)
-        args.epochs  = 2
-    else:
-        from data.dataset import get_dataloaders
-        train_loader, _ = get_dataloaders(
-            data_root=args.data_root, batch_size=args.batch_size,
-            num_workers=args.num_workers, val_frac=args.val_frac,
+    if is_main_process():
+        print(
+            f"Device: {device}"
         )
 
-    # ── Модели ────────────────────────────────────────────────────────────────
-    G = Generator(latent_dim=args.latent_dim, ngf=args.ngf).to(device)
-    D = Discriminator(nc=3, ndf=args.ndf).to(device)
+        if distributed:
+            print(
+                "DDP world size:",
+                torch.distributed.get_world_size(),
+            )
 
-    G.apply(weights_init)
-    D.apply(weights_init)
+    if args.dry_run:
+        train_loader = DummyDataLoader(
+            args.batch_size,
+            10,
+        )
 
-    if use_multi_gpu:
-        G = nn.DataParallel(G)
-        D = nn.DataParallel(D)
+        train_sampler = None
+        args.epochs = 2
 
-    print_model_info(G, f"Generator  (latent_dim={args.latent_dim})")
-    print_model_info(D, "Discriminator (Spectral Norm)")
+    else:
+        from data.dataset import (
+            get_dataloaders,
+        )
 
-    # ── Оптимизаторы ──────────────────────────────────────────────────────────
-    opt_g = optim.Adam(G.parameters(), lr=args.lr_g, betas=(args.beta1, args.beta2))
-    opt_d = optim.Adam(D.parameters(), lr=args.lr_d, betas=(args.beta1, args.beta2))
+        (
+            train_loader,
+            _,
+            train_sampler,
+            _,
+        ) = get_dataloaders(
+            data_root=args.data_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            val_frac=args.val_frac,
+            pin_memory=args.pin_memory,
+            distributed=distributed,
+            seed=args.seed,
+        )
+
+    generator = Generator(
+        latent_dim=args.latent_dim,
+        ngf=args.ngf,
+    )
+
+    discriminator = Discriminator(
+        nc=3,
+        ndf=args.ndf,
+    )
+
+    generator.apply(weights_init)
+    discriminator.apply(weights_init)
+
+    generator = wrap_ddp(
+        generator,
+        device,
+        local_rank,
+        distributed,
+    )
+
+    discriminator = wrap_ddp(
+        discriminator,
+        device,
+        local_rank,
+        distributed,
+    )
+
+    if is_main_process():
+        print_model_info(
+            generator,
+            "Generator",
+        )
+
+        print_model_info(
+            discriminator,
+            "Discriminator",
+        )
+
+    optimizer_g = optim.Adam(
+        generator.parameters(),
+        lr=args.lr_g,
+        betas=(
+            args.beta1,
+            args.beta2,
+        ),
+    )
+
+    optimizer_d = optim.Adam(
+        discriminator.parameters(),
+        lr=args.lr_d,
+        betas=(
+            args.beta1,
+            args.beta2,
+        ),
+    )
 
     criterion = nn.BCELoss()
 
-    # Фиксированный шум для мониторинга прогресса
-    fixed_noise = torch.randn(args.n_samples, args.latent_dim, 1, 1, device=device)
-
-    # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 1
+
     if args.resume:
-        ckpt = load_checkpoint(args.resume, device=str(device))
-        G_base = G.module if isinstance(G, nn.DataParallel) else G
-        D_base = D.module if isinstance(D, nn.DataParallel) else D
+        checkpoint = load_checkpoint(
+            args.resume,
+            device=str(device),
+        )
 
-        G_base.load_state_dict(ckpt["G"])
-        D_base.load_state_dict(ckpt["D"])
+        unwrap_model(
+            generator
+        ).load_state_dict(
+            checkpoint["G"]
+        )
 
-        opt_g.load_state_dict(ckpt["opt_g"])
-        opt_d.load_state_dict(ckpt["opt_d"])
-        start_epoch = ckpt.get("epoch", 0) + 1
+        unwrap_model(
+            discriminator
+        ).load_state_dict(
+            checkpoint["D"]
+        )
 
-    # ── Логгер и визуализатор ─────────────────────────────────────────────────
-    logger = TrainingLogger(args.output_dir, model_name="GAN")
-    vis    = Visualizer(args.output_dir, model_name="DCGAN")
+        optimizer_g.load_state_dict(
+            checkpoint["opt_g"]
+        )
 
-    print(f"\n{'═' * 60}")
-    print(f"  Epochs: {args.epochs}  |  Batch: {args.batch_size}")
-    print(f"  LR_G: {args.lr_g}  |  LR_D: {args.lr_d}")
-    print(f"  Label smooth: {args.label_smooth}")
-    print(f"{'═' * 60}\n")
+        optimizer_d.load_state_dict(
+            checkpoint["opt_d"]
+        )
 
-    # ── Training Loop ─────────────────────────────────────────────────────────
-    for epoch in range(start_epoch, args.epochs + 1):
+        start_epoch = (
+            checkpoint.get(
+                "epoch",
+                0,
+            )
+            + 1
+        )
+
+    logger = None
+    visualizer = None
+
+    if is_main_process():
+        logger = TrainingLogger(
+            args.output_dir,
+            model_name="GAN",
+        )
+
+        visualizer = Visualizer(
+            args.output_dir,
+            model_name="DCGAN",
+        )
+
+    fixed_noise = torch.randn(
+        args.n_samples,
+        args.latent_dim,
+        1,
+        1,
+        device=device,
+    )
+
+    for epoch in range(
+        start_epoch,
+        args.epochs + 1,
+    ):
+        if (
+            distributed
+            and train_sampler is not None
+        ):
+            train_sampler.set_epoch(
+                epoch
+            )
 
         metrics = train_epoch(
-            G, D, train_loader, opt_g, opt_d, criterion,
-            device, args, logger, epoch, fixed_noise,
+            generator,
+            discriminator,
+            train_loader,
+            optimizer_g,
+            optimizer_d,
+            criterion,
+            device,
+            args,
+            logger,
+            epoch,
         )
-        logger.log_epoch(epoch=epoch, **metrics)
-        logger.print_epoch_summary(epoch=epoch, **metrics)
 
-        # Предупреждение о mode collapse
-        if metrics["D_x"] < 0.3:
-            print("  ⚠️  D(x) < 0.3 — D слишком слабый, рассмотри снижение lr_d")
-        if metrics["D_G_z2"] > 0.8:
-            print("  ⚠️  D(G(z)) > 0.8 — возможен mode collapse")
+        if not is_main_process():
+            continue
 
-        # ── Образцы ──────────────────────────────────────────────────────────
-        if epoch % args.sample_every == 0 or epoch == args.epochs:
-            G.eval()
+        logger.log_epoch(
+            epoch=epoch,
+            **metrics,
+        )
+
+        logger.print_epoch_summary(
+            epoch=epoch,
+            **metrics,
+        )
+
+        if (
+            epoch % args.sample_every == 0
+            or epoch == args.epochs
+        ):
+            generator.eval()
+
             with torch.no_grad():
-                fake_imgs = G(fixed_noise)
-            save_sample_grid(
-                fake_imgs,
-                path=f"{args.output_dir}/samples/gen_ep{epoch:03d}.png",
-                nrow=8,
-                title=f"DCGAN Generated — Epoch {epoch}",
-            )
-            G.train()
+                samples = generator(
+                    fixed_noise
+                )
 
-        # ── Чекпоинт ─────────────────────────────────────────────────────────
-        if epoch % args.save_every == 0 or epoch == args.epochs:
+            save_sample_grid(
+                samples,
+                (
+                    f"{args.output_dir}/"
+                    f"samples/"
+                    f"gen_ep{epoch:03d}.png"
+                ),
+                nrow=8,
+                title=(
+                    f"DCGAN Generated — "
+                    f"Epoch {epoch}"
+                ),
+            )
+
+            generator.train()
+
+        if (
+            epoch % args.save_every == 0
+            or epoch == args.epochs
+        ):
             save_checkpoint(
                 {
                     "epoch": epoch,
-                    "G": G.module.state_dict()
-                    if isinstance(G, nn.DataParallel)
-                    else G.state_dict(),
-                    "D": D.module.state_dict()
-                    if isinstance(D, nn.DataParallel)
-                    else D.state_dict(),
-                    "opt_g": opt_g.state_dict(),
-                    "opt_d": opt_d.state_dict(),
+                    "G": unwrap_model(
+                        generator
+                    ).state_dict(),
+                    "D": unwrap_model(
+                        discriminator
+                    ).state_dict(),
+                    "opt_g": optimizer_g.state_dict(),
+                    "opt_d": optimizer_d.state_dict(),
                     "args": vars(args),
                 },
                 args.output_dir,
-                filename=f"checkpoint_ep{epoch:03d}.pt",
+                filename=(
+                    f"checkpoint_ep"
+                    f"{epoch:03d}.pt"
+                ),
             )
 
-        # ── Графики ───────────────────────────────────────────────────────────
-        if epoch % args.save_every == 0 or epoch == args.epochs:
-            vis.plot_curves(logger.epoch_history, epoch=epoch, save=True)
+            visualizer.plot_curves(
+                logger.epoch_history,
+                epoch=epoch,
+                save=True,
+            )
 
-    # ── Финальный постер ──────────────────────────────────────────────────────
-    G.eval()
-    with torch.no_grad():
-        final_samples = G(fixed_noise)
-    vis.plot_final_summary(logger.epoch_history, samples=final_samples)
+    if is_main_process():
+        logger.close()
 
-    logger.close()
-    print(f"\n✅ Обучение завершено! Результаты → {args.output_dir}/")
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

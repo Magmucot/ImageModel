@@ -1,391 +1,727 @@
 """
-Скрипт обучения β-VAE на датасете FFHQ 128×128.
+Обучение beta-VAE.
 
-Запуск:
-    python VAE/train.py --data_root ./data --epochs 50 --batch_size 32
-    python VAE/train.py --config configs/vae.yaml
-    python VAE/train.py --resume checkpoints/vae/checkpoint_ep020.pt
+Single GPU:
 
-Опции:
-    --dry_run   — 2 мини-эпохи без реальных данных (для проверки кода)
+    python VAE/train.py \
+        --config configs/vae.yaml
+
+Multi GPU:
+
+    torchrun --standalone \
+        --nproc_per_node=4 \
+        VAE/train.py \
+        --config configs/vae.yaml
 """
 
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import argparse
-import yaml
-import math
 from pathlib import Path
-
-# Добавляем корень проекта в sys.path
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import yaml
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 from VAE.vae import VAE, vae_loss
+from utils.distributed import (
+    cleanup_distributed,
+    is_main_process,
+    reduce_mean,
+    seed_everything,
+    setup_distributed,
+    unwrap_model,
+    wrap_ddp,
+)
 from utils.utils import (
-    TrainingLogger, Visualizer,
-    save_checkpoint, load_checkpoint,
-    save_sample_grid, print_model_info,
+    TrainingLogger,
+    Visualizer,
+    load_checkpoint,
+    print_model_info,
+    save_checkpoint,
+    save_sample_grid,
 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Аргументы
-# ─────────────────────────────────────────────────────────────────────────────
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="β-VAE Training on FFHQ 128×128")
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return yaml.safe_load(file) or {}
 
-    # Конфиг
-    parser.add_argument("--config", type=str, default="configs/vae.yaml",
-                        help="путь к YAML конфигу (перекрывается CLI аргументами)")
 
-    # Данные
-    parser.add_argument("--data_root",   type=str,   default="./data")
-    parser.add_argument("--val_frac",    type=float, default=0.05)
-    parser.add_argument("--num_workers", type=int,   default=4)
+def get_config_value(
+    config: dict,
+    key: str,
+    default,
+):
+    """
+    Ищет параметр во всех секциях YAML.
 
-    # Модель
-    parser.add_argument("--latent_dim",  type=int,   default=256)
-    parser.add_argument("--beta",        type=float, default=4.0)
+    Например:
 
-    # Обучение
-    parser.add_argument("--epochs",      type=int,   default=50)
-    parser.add_argument("--batch_size",  type=int,   default=32)
-    parser.add_argument("--lr",          type=float, default=1e-4)
-    parser.add_argument("--weight_decay",type=float, default=1e-5)
-    parser.add_argument("--grad_clip",   type=float, default=1.0)
-    parser.add_argument("--warmup_epochs",type=int,  default=2)
+        training:
+          batch_size: 32
 
-    # Логирование / чекпоинты
-    parser.add_argument("--output_dir",  type=str,   default="checkpoints/vae")
-    parser.add_argument("--save_every",  type=int,   default=5)
-    parser.add_argument("--sample_every",type=int,   default=5)
-    parser.add_argument("--log_every",   type=int,   default=20)
-    parser.add_argument("--n_samples",   type=int,   default=64)
+    будет найден как batch_size.
+    """
 
-    # Прочее
-    parser.add_argument("--device",      type=str,   default="auto")
-    parser.add_argument("--resume",      type=str,   default=None,
-                        help="путь к чекпоинту для продолжения обучения")
-    parser.add_argument("--seed",        type=int,   default=42)
-    parser.add_argument("--dry_run",     action="store_true",
-                        help="2 мини-эпохи без реальных данных")
+    for section in config.values():
+        if not isinstance(section, dict):
+            continue
+
+        if key in section:
+            return section[key]
+
+    return default
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--config",
+        default="configs/vae.yaml",
+    )
+
+    parser.add_argument(
+        "--data_root",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--val_frac",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--pin_memory",
+        type=lambda x: x.lower() == "true",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--latent_dim",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--beta",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--output_dir",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--save_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--sample_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--n_samples",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--device",
+        default="auto",
+    )
+
+    parser.add_argument(
+        "--resume",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+    )
 
     args = parser.parse_args()
 
-    # Загружаем YAML и перезаписываем дефолты (если файл существует)
-    if os.path.exists(args.config):
-        with open(args.config, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        for section in cfg.values():
-            if isinstance(section, dict):
-                for k, v in section.items():
-                    if hasattr(args, k) and getattr(args, k) == parser.get_default(k):
-                        setattr(args, k, v)
+    config = load_config(
+        args.config
+    )
+
+    defaults = {
+        "data_root": "./data",
+        "val_frac": 0.05,
+        "num_workers": 4,
+        "pin_memory": True,
+        "latent_dim": 256,
+        "beta": 4.0,
+        "epochs": 50,
+        "batch_size": 32,
+        "lr": 1e-4,
+        "weight_decay": 1e-5,
+        "grad_clip": 1.0,
+        "warmup_epochs": 2,
+        "output_dir": "checkpoints/vae",
+        "save_every": 5,
+        "sample_every": 5,
+        "log_every": 20,
+        "n_samples": 64,
+        "seed": 42,
+    }
+
+    for key, default in defaults.items():
+        if getattr(args, key) is None:
+            setattr(
+                args,
+                key,
+                get_config_value(
+                    config,
+                    key,
+                    default,
+                ),
+            )
 
     return args
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Синтетический датасет для dry_run
-# ─────────────────────────────────────────────────────────────────────────────
-
 class DummyDataLoader:
-    """Итерируется по случайным тензорам — для теста без данных."""
-    def __init__(self, batch_size: int = 8, n_batches: int = 5, device: str = "cpu"):
+    def __init__(
+        self,
+        batch_size: int,
+        n_batches: int,
+    ):
         self.batch_size = batch_size
-        self.n_batches  = n_batches
-        self.device     = device
+        self.n_batches = n_batches
 
     def __len__(self):
         return self.n_batches
 
     def __iter__(self):
         for _ in range(self.n_batches):
-            yield torch.randn(self.batch_size, 3, 128, 128)
+            yield torch.randn(
+                self.batch_size,
+                3,
+                128,
+                128,
+            )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LR Scheduler с warmup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def get_scheduler(optimizer, args, n_epochs: int):
-    """Cosine annealing с linear warmup."""
+def get_scheduler(
+    optimizer,
+    args,
+):
     if args.warmup_epochs > 0:
-        from torch.optim.lr_scheduler import LinearLR, SequentialLR
-        warmup = LinearLR(optimizer, start_factor=0.01, end_factor=1.0,
-                          total_iters=args.warmup_epochs)
-        cosine = CosineAnnealingLR(optimizer, T_max=max(1, n_epochs - args.warmup_epochs),
-                                   eta_min=args.lr * 0.01)
-        return SequentialLR(optimizer, [warmup, cosine],
-                            milestones=[args.warmup_epochs])
-    return CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=args.lr * 0.01)
+        warmup = LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=args.warmup_epochs,
+        )
 
+        cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                args.epochs
+                - args.warmup_epochs,
+            ),
+            eta_min=args.lr * 0.01,
+        )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Эпоха обучения
-# ─────────────────────────────────────────────────────────────────────────────
+        return SequentialLR(
+            optimizer,
+            [warmup, cosine],
+            milestones=[
+                args.warmup_epochs
+            ],
+        )
+
+    return CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.lr * 0.01,
+    )
+
 
 def train_epoch(
-    model:     VAE,
+    model,
     loader,
-    optimizer: torch.optim.Optimizer,
-    device:    torch.device,
-    args:      argparse.Namespace,
-    logger:    TrainingLogger,
-    epoch:     int,
-) -> dict:
-    """Один проход по тренировочному датасету."""
+    optimizer,
+    device,
+    args,
+    logger,
+    epoch,
+):
     model.train()
-    total_loss_acc  = 0.0
-    recon_loss_acc  = 0.0
-    kl_loss_acc     = 0.0
+
+    total_sum = 0.0
+    recon_sum = 0.0
+    kl_sum = 0.0
+
+    steps = 0
+
+    base_model = unwrap_model(model)
 
     for step, batch in enumerate(loader):
-        imgs = batch.to(device, non_blocking=True)
+        images = batch.to(
+            device,
+            non_blocking=True,
+        )
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(
+            set_to_none=True
+        )
 
-        recon, mu, logvar = model(imgs)
-        total, recon_l, kl_l = vae_loss(recon, imgs, mu, logvar, beta=model.beta)
+        recon, mu, logvar = model(
+            images
+        )
+
+        total, recon_loss, kl_loss = (
+            vae_loss(
+                recon,
+                images,
+                mu,
+                logvar,
+                beta=base_model.beta,
+            )
+        )
 
         total.backward()
 
         if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                args.grad_clip,
+            )
 
         optimizer.step()
 
-        total_loss_acc += total.item()
-        recon_loss_acc += recon_l.item()
-        kl_loss_acc    += kl_l.item()
+        total_sum += total.detach()
+        recon_sum += recon_loss.detach()
+        kl_sum += kl_loss.detach()
 
-        if (step + 1) % args.log_every == 0:
+        steps += 1
+
+        if (
+            is_main_process()
+            and (step + 1) % args.log_every == 0
+        ):
             logger.log(
-                epoch=epoch, step=step + 1,
+                epoch=epoch,
+                step=step + 1,
                 total_loss=total.item(),
-                recon_loss=recon_l.item(),
-                kl_loss=kl_l.item(),
-            )
-            logger.print_step(
-                epoch, args.epochs, step + 1, len(loader),
-                total=total.item(), recon=recon_l.item(), kl=kl_l.item(),
+                recon_loss=recon_loss.item(),
+                kl_loss=kl_loss.item(),
             )
 
-    n = len(loader)
+    steps = max(steps, 1)
+
     return {
-        "total_loss": total_loss_acc / n,
-        "recon_loss": recon_loss_acc / n,
-        "kl_loss":    kl_loss_acc    / n,
+        "total_loss": reduce_mean(
+            total_sum / steps
+        ).item(),
+        "recon_loss": reduce_mean(
+            recon_sum / steps
+        ).item(),
+        "kl_loss": reduce_mean(
+            kl_sum / steps
+        ).item(),
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Валидационная эпоха
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def val_epoch(
-    model:  VAE,
+    model,
     loader,
-    device: torch.device,
-    args:   argparse.Namespace,
-) -> dict:
-    """Один проход по валидационному датасету."""
+    device,
+):
     model.eval()
-    total_acc = recon_acc = kl_acc = 0.0
+
+    base_model = unwrap_model(model)
+
+    total_sum = 0.0
+    recon_sum = 0.0
+    kl_sum = 0.0
+    steps = 0
 
     for batch in loader:
-        imgs = batch.to(device, non_blocking=True)
-        recon, mu, logvar = model(imgs)
-        total, recon_l, kl_l = vae_loss(recon, imgs, mu, logvar, beta=model.beta)
-        total_acc += total.item()
-        recon_acc += recon_l.item()
-        kl_acc    += kl_l.item()
+        images = batch.to(
+            device,
+            non_blocking=True,
+        )
 
-    n = max(len(loader), 1)
+        recon, mu, logvar = model(
+            images
+        )
+
+        total, recon_loss, kl_loss = (
+            vae_loss(
+                recon,
+                images,
+                mu,
+                logvar,
+                beta=base_model.beta,
+            )
+        )
+
+        total_sum += total
+        recon_sum += recon_loss
+        kl_sum += kl_loss
+
+        steps += 1
+
+    steps = max(steps, 1)
+
     return {
-        "val_total":    total_acc / n,
-        "val_recon":    recon_acc / n,
-        "val_kl":       kl_acc    / n,
+        "val_total": reduce_mean(
+            total_sum / steps
+        ).item(),
+        "val_recon": reduce_mean(
+            recon_sum / steps
+        ).item(),
+        "val_kl": reduce_mean(
+            kl_sum / steps
+        ).item(),
     }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     args = parse_args()
 
-    # Воспроизводимость
-    torch.manual_seed(args.seed)
+    device, local_rank, distributed = (
+        setup_distributed(
+            args.device
+        )
+    )
 
-    # Устройство
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    seed_everything(
+        args.seed
+    )
 
-    use_multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
+    if is_main_process():
+        print(
+            f"Device: {device}"
+        )
 
-    if use_multi_gpu:
-        print(f"Using {torch.cuda.device_count()} GPUs")
+        if distributed:
+            print(
+                "DDP world size:",
+                torch.distributed.get_world_size(),
+            )
 
-    # ── Данные ───────────────────────────────────────────────────────────────
     if args.dry_run:
-        print("⚠️  DRY RUN — используются синтетические данные")
-        train_loader = DummyDataLoader(batch_size=args.batch_size, n_batches=10)
-        val_loader   = DummyDataLoader(batch_size=args.batch_size, n_batches=3)
-        args.epochs  = 2
+        train_loader = DummyDataLoader(
+            args.batch_size,
+            5,
+        )
+
+        val_loader = DummyDataLoader(
+            args.batch_size,
+            2,
+        )
+
+        train_sampler = None
+
+        args.epochs = 2
+
     else:
-        from data.dataset import get_dataloaders
-        train_loader, val_loader = get_dataloaders(
+        from data.dataset import (
+            get_dataloaders,
+        )
+
+        (
+            train_loader,
+            val_loader,
+            train_sampler,
+            _,
+        ) = get_dataloaders(
             data_root=args.data_root,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             val_frac=args.val_frac,
+            pin_memory=args.pin_memory,
+            distributed=distributed,
+            seed=args.seed,
         )
 
-    # ── Модель ────────────────────────────────────────────────────────────────
     model = VAE(
         latent_dim=args.latent_dim,
         beta=args.beta,
-    ).to(device)
+    )
 
-    if use_multi_gpu:
-        model = torch.nn.DataParallel(model)
+    model = wrap_ddp(
+        model,
+        device,
+        local_rank,
+        distributed,
+    )
 
-    print_model_info(model, f"β-VAE  (latent_dim={args.latent_dim}, β={args.beta})")
+    if is_main_process():
+        print_model_info(
+            model,
+            (
+                "β-VAE "
+                f"(latent_dim={args.latent_dim}, "
+                f"β={args.beta})"
+            ),
+        )
 
-    # ── Оптимизатор + Scheduler ───────────────────────────────────────────────
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
-    scheduler = get_scheduler(optimizer, args, args.epochs)
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
 
-    # ── Resume ────────────────────────────────────────────────────────────────
+    scheduler = get_scheduler(
+        optimizer,
+        args,
+    )
+
     start_epoch = 1
-    best_val    = float("inf")
+    best_val = float("inf")
+
     if args.resume:
-        ckpt = load_checkpoint(args.resume, device=str(device))
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val    = ckpt.get("best_val", float("inf"))
+        checkpoint = load_checkpoint(
+            args.resume,
+            device=str(device),
+        )
 
-    # ── Логгер и визуализатор ─────────────────────────────────────────────────
-    logger = TrainingLogger(args.output_dir, model_name="VAE")
-    vis    = Visualizer(args.output_dir, model_name="β-VAE")
+        unwrap_model(
+            model
+        ).load_state_dict(
+            checkpoint["model"]
+        )
 
-    print(f"\n{'═' * 60}")
-    print(f"  Epochs:      {args.epochs}")
-    print(f"  Batch size:  {args.batch_size}")
-    print(f"  LR:          {args.lr}")
-    print(f"  Output dir:  {args.output_dir}")
-    print(f"{'═' * 60}\n")
+        optimizer.load_state_dict(
+            checkpoint["optimizer"]
+        )
 
-    # ── Training Loop ─────────────────────────────────────────────────────────
-    for epoch in range(start_epoch, args.epochs + 1):
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(
+                checkpoint["scheduler"]
+            )
 
-        # Обучение
-        train_metrics = train_epoch(model, train_loader, optimizer, device, args, logger, epoch)
+        start_epoch = (
+            checkpoint.get(
+                "epoch",
+                0,
+            )
+            + 1
+        )
 
-        # Валидация
-        val_metrics = val_epoch(model, val_loader, device, args)
+        best_val = checkpoint.get(
+            "best_val",
+            float("inf"),
+        )
 
-        # LR step
+    logger = None
+    visualizer = None
+
+    if is_main_process():
+        logger = TrainingLogger(
+            args.output_dir,
+            model_name="VAE",
+        )
+
+        visualizer = Visualizer(
+            args.output_dir,
+            model_name="β-VAE",
+        )
+
+    for epoch in range(
+        start_epoch,
+        args.epochs + 1,
+    ):
+        if (
+            distributed
+            and train_sampler is not None
+        ):
+            train_sampler.set_epoch(
+                epoch
+            )
+
+        train_metrics = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            args,
+            logger,
+            epoch,
+        )
+
+        val_metrics = val_epoch(
+            model,
+            val_loader,
+            device,
+        )
+
         scheduler.step()
 
-        # Логируем эпоху
-        epoch_metrics = {**train_metrics, **val_metrics}
-        logger.log_epoch(epoch=epoch, **epoch_metrics)
-        logger.print_epoch_summary(epoch=epoch, **epoch_metrics)
+        if not is_main_process():
+            continue
 
-        is_best = val_metrics["val_total"] < best_val
+        metrics = {
+            **train_metrics,
+            **val_metrics,
+        }
+
+        logger.log_epoch(
+            epoch=epoch,
+            **metrics,
+        )
+
+        logger.print_epoch_summary(
+            epoch=epoch,
+            **metrics,
+        )
+
+        is_best = (
+            val_metrics["val_total"]
+            < best_val
+        )
+
         if is_best:
-            best_val = val_metrics["val_total"]
+            best_val = (
+                val_metrics["val_total"]
+            )
 
-        # ── Чекпоинт ─────────────────────────────────────────────────────────
-        if epoch % args.save_every == 0 or epoch == args.epochs:
-            state = {
-                "epoch":     epoch,
-                "model": (
-                            model.module.state_dict()
-                            if isinstance(model, torch.nn.DataParallel)
-                            else model.state_dict()
-                        ),  
-                "optimizer": optimizer.state_dict(),
-                "best_val":  best_val,
-                "args":      vars(args),
-            }
+        if (
+            epoch % args.save_every == 0
+            or epoch == args.epochs
+        ):
             save_checkpoint(
-                state, args.output_dir,
-                filename=f"checkpoint_ep{epoch:03d}.pt",
+                {
+                    "epoch": epoch,
+                    "model": unwrap_model(
+                        model
+                    ).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val": best_val,
+                    "args": vars(args),
+                },
+                args.output_dir,
+                filename=(
+                    f"checkpoint_ep"
+                    f"{epoch:03d}.pt"
+                ),
                 is_best=is_best,
             )
 
-        # ── Образцы ──────────────────────────────────────────────────────────
-        if epoch % args.sample_every == 0 or epoch == args.epochs:
-            with torch.no_grad():
-                # Сгенерированные из латентного пространства
-                model_base = (
-                    model.module
-                    if isinstance(model, torch.nn.DataParallel)
-                    else model
-                )
+        if (
+            epoch % args.sample_every == 0
+            or epoch == args.epochs
+        ):
+            samples = unwrap_model(
+                model
+            ).sample(
+                n=args.n_samples,
+                device=str(device),
+            )
 
-                samples = model_base.sample(
-                    n=args.n_samples,
-                    device=str(device),
-                )
-                save_sample_grid(
-                    samples,
-                    path=f"{args.output_dir}/samples/gen_ep{epoch:03d}.png",
-                    nrow=8,
-                    title=f"β-VAE Generated — Epoch {epoch}",
-                )
-                # Реконструкции (первый батч из val)
-                val_batch = next(iter(val_loader))
-                if isinstance(val_batch, torch.Tensor):
-                    val_batch = val_batch[:8].to(device)
-                    recon_val, _, _ = model(val_batch)
-                    comparison = torch.cat([val_batch[:8], recon_val[:8]])
-                    save_sample_grid(
-                        comparison,
-                        path=f"{args.output_dir}/samples/recon_ep{epoch:03d}.png",
-                        nrow=8,
-                        title=f"β-VAE Reconstructions — Epoch {epoch}",
-                    )
+            save_sample_grid(
+                samples,
+                (
+                    f"{args.output_dir}/"
+                    f"samples/"
+                    f"gen_ep{epoch:03d}.png"
+                ),
+                nrow=8,
+                title=(
+                    f"β-VAE Generated — "
+                    f"Epoch {epoch}"
+                ),
+            )
 
-        # ── Графики loss ──────────────────────────────────────────────────────
-        if epoch % args.save_every == 0 or epoch == args.epochs:
-            vis.plot_curves(logger.epoch_history, epoch=epoch, save=True)
+            visualizer.plot_curves(
+                logger.epoch_history,
+                epoch=epoch,
+                save=True,
+            )
 
-    # ── Финальный постер ──────────────────────────────────────────────────────
-    with torch.no_grad():
-        model_base = (
-            model.module
-            if isinstance(model, torch.nn.DataParallel)
-            else model
-        )
+    if is_main_process():
+        logger.close()
 
-        final_samples = model_base.sample(
-            n=args.n_samples,
-            device=str(device),
-        )
-    vis.plot_final_summary(
-        logger.epoch_history,
-        samples=final_samples,
-        extra_info=f"β={args.beta}",
-    )
-
-    logger.close()
-    print(f"\n✅ Обучение завершено! Результаты → {args.output_dir}/")
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

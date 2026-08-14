@@ -1,21 +1,20 @@
 """
-Скрипт обучения DDPM (UNet + Self-Attention + Cosine Schedule) на FFHQ 128×128.
+Обучение DDPM.
 
-Запуск:
-    python DDPM/train.py --data_root ./data --epochs 200 --batch_size 16
-    python DDPM/train.py --config configs/ddpm.yaml
-    python DDPM/train.py --resume checkpoints/ddpm/checkpoint_ep100.pt
+Single GPU:
 
-Опции:
-    --dry_run   — 2 мини-эпохи без реальных данных
-    --ema_decay — EMA весов модели (рекомендуется 0.9999 для DDPM)
+    python DDPM/train.py \
+        --config configs/ddpm.yaml
 
-Замечание:
-    Один шаг семплирования DDPM требует T forward-пассов через UNet,
-    поэтому sample_every лучше ставить 20+.
-    Для быстрого семплинга в ноутбуке используйте DDIM (не реализовано здесь,
-    но легко добавить поверх той же модели).
+Multi GPU:
+
+    torchrun --standalone \
+        --nproc_per_node=4 \
+        DDPM/train.py \
+        --config configs/ddpm.yaml
 """
+
+from __future__ import annotations
 
 import argparse
 import copy
@@ -26,12 +25,25 @@ from pathlib import Path
 import torch
 import torch.optim as optim
 import yaml
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    LinearLR,
+    SequentialLR,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from DDPM.ddpm import DDPM, UNet
+from utils.distributed import (
+    cleanup_distributed,
+    is_main_process,
+    reduce_mean,
+    seed_everything,
+    setup_distributed,
+    unwrap_model,
+    wrap_ddp,
+)
 from utils.utils import (
     TrainingLogger,
     Visualizer,
@@ -43,7 +55,7 @@ from utils.utils import (
 
 
 class EMA:
-    """Экспоненциальное скользящее среднее весов базовой UNet."""
+    """EMA настоящей UNet-модели."""
 
     def __init__(
         self,
@@ -51,170 +63,217 @@ class EMA:
         decay: float = 0.9999,
     ):
         self.decay = decay
-        self.shadow = copy.deepcopy(model).eval()
 
-        for param in self.shadow.parameters():
-            param.requires_grad_(False)
+        self.shadow = copy.deepcopy(
+            model
+        ).eval()
+
+        for parameter in self.shadow.parameters():
+            parameter.requires_grad_(False)
 
     @torch.no_grad()
-    def update(self, model: torch.nn.Module) -> None:
-        """Обновляет EMA-веса после шага оптимизатора."""
-        for shadow_param, model_param in zip(
+    def update(
+        self,
+        model: torch.nn.Module,
+    ):
+        for shadow, current in zip(
             self.shadow.parameters(),
             model.parameters(),
         ):
-            shadow_param.data.mul_(self.decay).add_(
-                model_param.data,
+            shadow.mul_(
+                self.decay
+            ).add_(
+                current,
                 alpha=1.0 - self.decay,
             )
 
-    def state_dict(self) -> dict:
+    def state_dict(self):
         return self.shadow.state_dict()
 
-    def load_state_dict(self, state_dict: dict) -> None:
-        self.shadow.load_state_dict(state_dict)
+    def load_state_dict(
+        self,
+        state_dict,
+    ):
+        self.shadow.load_state_dict(
+            state_dict
+        )
 
 
-def get_base_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Возвращает модель без DataParallel-обёртки."""
-    if isinstance(model, torch.nn.DataParallel):
-        return model.module
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
 
-    return model
+    with open(
+        path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return yaml.safe_load(file) or {}
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="DDPM Training on FFHQ 128×128",
-    )
+def get_config_value(
+    config: dict,
+    key: str,
+    default,
+):
+    for section in config.values():
+        if not isinstance(section, dict):
+            continue
+
+        if key in section:
+            return section[key]
+
+    return default
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
 
     parser.add_argument(
         "--config",
-        type=str,
         default="configs/ddpm.yaml",
     )
+
     parser.add_argument(
         "--data_root",
-        type=str,
-        default="./data",
+        default=None,
     )
+
     parser.add_argument(
         "--val_frac",
         type=float,
-        default=0.05,
+        default=None,
     )
+
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--pin_memory",
+        type=lambda x: x.lower() == "true",
+        default=None,
     )
 
     parser.add_argument(
         "--base_channels",
         type=int,
-        default=64,
+        default=None,
     )
+
     parser.add_argument(
         "--time_emb_dim",
         type=int,
-        default=256,
+        default=None,
     )
+
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=1000,
+        default=None,
     )
+
     parser.add_argument(
         "--schedule",
-        type=str,
-        default="cosine",
         choices=["cosine", "linear"],
+        default=None,
     )
+
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.1,
+        default=None,
     )
 
     parser.add_argument(
         "--epochs",
         type=int,
-        default=200,
+        default=None,
     )
+
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=16,
+        default=None,
     )
+
     parser.add_argument(
         "--lr",
         type=float,
-        default=2e-4,
+        default=None,
     )
+
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=0.0,
+        default=None,
     )
+
     parser.add_argument(
         "--grad_clip",
         type=float,
-        default=1.0,
+        default=None,
     )
+
     parser.add_argument(
         "--warmup_epochs",
         type=int,
-        default=5,
+        default=None,
     )
+
     parser.add_argument(
         "--ema_decay",
         type=float,
-        default=0.9999,
-        help="EMA decay для весов модели (0 = отключено)",
+        default=None,
     )
 
     parser.add_argument(
         "--output_dir",
-        type=str,
-        default="checkpoints/ddpm",
+        default=None,
     )
+
     parser.add_argument(
         "--save_every",
         type=int,
-        default=10,
+        default=None,
     )
+
     parser.add_argument(
         "--sample_every",
         type=int,
-        default=20,
-        help="семплирование DDPM медленное — ставьте 20+",
+        default=None,
     )
+
     parser.add_argument(
         "--log_every",
         type=int,
-        default=10,
+        default=None,
     )
+
     parser.add_argument(
         "--n_samples",
         type=int,
-        default=16,
+        default=None,
     )
 
     parser.add_argument(
         "--device",
-        type=str,
         default="auto",
     )
+
     parser.add_argument(
         "--resume",
-        type=str,
         default=None,
     )
+
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=None,
     )
+
     parser.add_argument(
         "--dry_run",
         action="store_true",
@@ -222,31 +281,55 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
 
-    if os.path.exists(args.config):
-        with open(args.config, "r", encoding="utf-8") as file:
-            cfg = yaml.safe_load(file)
+    config = load_config(
+        args.config
+    )
 
-        for section in cfg.values():
-            if not isinstance(section, dict):
-                continue
+    defaults = {
+        "data_root": "./data",
+        "val_frac": 0.05,
+        "num_workers": 4,
+        "pin_memory": True,
+        "base_channels": 64,
+        "time_emb_dim": 256,
+        "timesteps": 1000,
+        "schedule": "cosine",
+        "dropout": 0.1,
+        "epochs": 200,
+        "batch_size": 16,
+        "lr": 2e-4,
+        "weight_decay": 0.0,
+        "grad_clip": 1.0,
+        "warmup_epochs": 5,
+        "ema_decay": 0.9999,
+        "output_dir": "checkpoints/ddpm",
+        "save_every": 10,
+        "sample_every": 20,
+        "log_every": 10,
+        "n_samples": 16,
+        "seed": 42,
+    }
 
-            for key, value in section.items():
-                if (
-                    hasattr(args, key)
-                    and getattr(args, key) == parser.get_default(key)
-                ):
-                    setattr(args, key, value)
+    for key, default in defaults.items():
+        if getattr(args, key) is None:
+            setattr(
+                args,
+                key,
+                get_config_value(
+                    config,
+                    key,
+                    default,
+                ),
+            )
 
     return args
 
 
 class DummyDataLoader:
-    """Синтетический DataLoader для dry-run."""
-
     def __init__(
         self,
-        batch_size: int = 4,
-        n_batches: int = 10,
+        batch_size,
+        n_batches=10,
     ):
         self.batch_size = batch_size
         self.n_batches = n_batches
@@ -268,13 +351,7 @@ def get_scheduler(
     optimizer,
     args,
 ):
-    """Создаёт scheduler с optional warmup."""
     if args.warmup_epochs > 0:
-        from torch.optim.lr_scheduler import (
-            LinearLR,
-            SequentialLR,
-        )
-
         warmup = LinearLR(
             optimizer,
             start_factor=0.01,
@@ -286,7 +363,8 @@ def get_scheduler(
             optimizer,
             T_max=max(
                 1,
-                args.epochs - args.warmup_epochs,
+                args.epochs
+                - args.warmup_epochs,
             ),
             eta_min=args.lr * 0.01,
         )
@@ -294,7 +372,9 @@ def get_scheduler(
         return SequentialLR(
             optimizer,
             [warmup, cosine],
-            milestones=[args.warmup_epochs],
+            milestones=[
+                args.warmup_epochs
+            ],
         )
 
     return CosineAnnealingLR(
@@ -305,28 +385,34 @@ def get_scheduler(
 
 
 def train_epoch(
-    ddpm: DDPM,
+    ddpm,
     loader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    args: argparse.Namespace,
-    logger: TrainingLogger,
-    epoch: int,
-    ema: EMA | None,
-) -> dict:
+    optimizer,
+    device,
+    args,
+    logger,
+    epoch,
+    ema,
+):
     ddpm.model.train()
 
-    loss_acc = 0.0
+    loss_sum = 0.0
+    steps = 0
 
     for step, batch in enumerate(loader):
-        imgs = batch.to(
+        images = batch.to(
             device,
             non_blocking=True,
         )
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(
+            set_to_none=True
+        )
 
-        loss = ddpm.loss_fn(imgs)
+        loss = ddpm.loss_fn(
+            images
+        )
+
         loss.backward()
 
         if args.grad_clip > 0:
@@ -339,140 +425,139 @@ def train_epoch(
 
         if ema is not None:
             ema.update(
-                get_base_model(ddpm.model),
+                unwrap_model(
+                    ddpm.model
+                )
             )
 
-        loss_acc += loss.item()
+        loss_sum += loss.detach()
+        steps += 1
 
-        if (step + 1) % args.log_every == 0:
+        if (
+            is_main_process()
+            and (step + 1) % args.log_every == 0
+        ):
             logger.log(
                 epoch=epoch,
                 step=step + 1,
                 mse_loss=loss.item(),
             )
 
-            logger.print_step(
-                epoch,
-                args.epochs,
-                step + 1,
-                len(loader),
-                mse_loss=loss.item(),
-            )
+    steps = max(steps, 1)
 
     return {
-        "mse_loss": loss_acc / max(len(loader), 1),
+        "mse_loss": reduce_mean(
+            loss_sum / steps
+        ).item(),
     }
 
 
 def main():
     args = parse_args()
 
-    torch.manual_seed(args.seed)
-
-    if args.device == "auto":
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu",
+    device, local_rank, distributed = (
+        setup_distributed(
+            args.device
         )
-    else:
-        device = torch.device(args.device)
-
-    use_multi_gpu = (
-        device.type == "cuda"
-        and torch.cuda.device_count() > 1
     )
 
-    if use_multi_gpu:
+    seed_everything(
+        args.seed
+    )
+
+    if is_main_process():
         print(
-            f"Using {torch.cuda.device_count()} GPUs",
+            f"Device: {device}"
         )
 
-    # -------------------------------------------------------------------------
-    # Data
-    # -------------------------------------------------------------------------
+        if distributed:
+            print(
+                "DDP world size:",
+                torch.distributed.get_world_size(),
+            )
 
     if args.dry_run:
-        print(
-            "⚠️  DRY RUN — используются синтетические данные",
+        train_loader = DummyDataLoader(
+            args.batch_size,
+            10,
         )
 
-        train_loader = DummyDataLoader(
-            batch_size=args.batch_size,
-            n_batches=10,
-        )
+        train_sampler = None
 
         args.epochs = 2
         args.sample_every = 2
 
     else:
-        from data.dataset import get_dataloaders
+        from data.dataset import (
+            get_dataloaders,
+        )
 
-        train_loader, _ = get_dataloaders(
+        (
+            train_loader,
+            _,
+            train_sampler,
+            _,
+        ) = get_dataloaders(
             data_root=args.data_root,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             val_frac=args.val_frac,
+            pin_memory=args.pin_memory,
+            distributed=distributed,
+            seed=args.seed,
         )
 
-    # -------------------------------------------------------------------------
-    # Model
-    # -------------------------------------------------------------------------
-
+    # ВАЖНО:
+    # сначала создаём обычную UNet,
+    # затем DDP оборачивает её.
     base_unet = UNet(
         img_channels=3,
         base_channels=args.base_channels,
         time_emb_dim=args.time_emb_dim,
         dropout=args.dropout,
-    ).to(device)
+    )
 
-    if use_multi_gpu:
-        unet = torch.nn.DataParallel(
-            base_unet,
-        )
-    else:
-        unet = base_unet
+    base_unet = base_unet.to(
+        device
+    )
+
+    model = wrap_ddp(
+        base_unet,
+        device,
+        local_rank,
+        distributed,
+    )
 
     ddpm = DDPM(
-        model=unet,
+        model=model,
         timesteps=args.timesteps,
         schedule=args.schedule,
         device=str(device),
     )
 
-    print_model_info(
-        unet,
-        (
-            f"UNet DDPM "
-            f"(base_ch={args.base_channels}, "
-            f"T={args.timesteps}, "
-            f"{args.schedule})"
-        ),
-    )
+    if is_main_process():
+        print_model_info(
+            model,
+            (
+                "DDPM UNet "
+                f"(base_channels="
+                f"{args.base_channels}, "
+                f"T={args.timesteps})"
+            ),
+        )
 
-    # EMA должна работать с настоящим UNet,
-    # а не с DataParallel.
-    ema = (
-        EMA(
+    # EMA должна хранить именно UNet,
+    # а не DistributedDataParallel.
+    ema = None
+
+    if args.ema_decay > 0:
+        ema = EMA(
             base_unet,
             decay=args.ema_decay,
         )
-        if args.ema_decay > 0
-        else None
-    )
-
-    if ema is not None:
-        print(
-            f"  EMA enabled "
-            f"(decay={args.ema_decay})",
-        )
-
-    # -------------------------------------------------------------------------
-    # Optimizer + scheduler
-    # -------------------------------------------------------------------------
 
     optimizer = optim.AdamW(
-        unet.parameters(),
+        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -482,84 +567,77 @@ def main():
         args,
     )
 
-    # -------------------------------------------------------------------------
-    # Resume
-    # -------------------------------------------------------------------------
-
     start_epoch = 1
     best_loss = float("inf")
 
     if args.resume:
-        ckpt = load_checkpoint(
+        checkpoint = load_checkpoint(
             args.resume,
             device=str(device),
         )
 
-        base_unet.load_state_dict(
-            ckpt["model"],
+        unwrap_model(
+            model
+        ).load_state_dict(
+            checkpoint["model"]
         )
 
         optimizer.load_state_dict(
-            ckpt["optimizer"],
+            checkpoint["optimizer"]
         )
+
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(
+                checkpoint["scheduler"]
+            )
 
         if (
             ema is not None
-            and "ema" in ckpt
+            and "ema" in checkpoint
         ):
             ema.load_state_dict(
-                ckpt["ema"],
+                checkpoint["ema"]
             )
 
         start_epoch = (
-            ckpt.get("epoch", 0) + 1
+            checkpoint.get(
+                "epoch",
+                0,
+            )
+            + 1
         )
 
-        best_loss = ckpt.get(
+        best_loss = checkpoint.get(
             "best_loss",
             float("inf"),
         )
 
-    # -------------------------------------------------------------------------
-    # Logger
-    # -------------------------------------------------------------------------
+    logger = None
+    visualizer = None
 
-    logger = TrainingLogger(
-        args.output_dir,
-        model_name="DDPM",
-    )
+    if is_main_process():
+        logger = TrainingLogger(
+            args.output_dir,
+            model_name="DDPM",
+        )
 
-    vis = Visualizer(
-        args.output_dir,
-        model_name="DDPM",
-    )
-
-    print(f"\n{'═' * 60}")
-    print(
-        f"  Epochs:       {args.epochs}",
-    )
-    print(
-        f"  Batch size:   {args.batch_size}",
-    )
-    print(
-        f"  Timesteps:    {args.timesteps}",
-    )
-    print(
-        f"  Sample every: {args.sample_every} epochs",
-    )
-    print(
-        f"  Output dir:   {args.output_dir}",
-    )
-    print(f"{'═' * 60}\n")
-
-    # -------------------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------------------
+        visualizer = Visualizer(
+            args.output_dir,
+            model_name="DDPM",
+        )
 
     for epoch in range(
         start_epoch,
         args.epochs + 1,
     ):
+        if (
+            distributed
+            and train_sampler is not None
+        ):
+            train_sampler.set_epoch(
+                epoch
+            )
+
         metrics = train_epoch(
             ddpm,
             train_loader,
@@ -573,6 +651,9 @@ def main():
 
         scheduler.step()
 
+        if not is_main_process():
+            continue
+
         logger.log_epoch(
             epoch=epoch,
             **metrics,
@@ -584,34 +665,27 @@ def main():
         )
 
         is_best = (
-            metrics["mse_loss"] < best_loss
+            metrics["mse_loss"]
+            < best_loss
         )
 
         if is_best:
-            best_loss = metrics["mse_loss"]
-
-        # ---------------------------------------------------------------------
-        # Sampling
-        # ---------------------------------------------------------------------
+            best_loss = (
+                metrics["mse_loss"]
+            )
 
         if (
             epoch % args.sample_every == 0
             or epoch == args.epochs
         ):
-            print(
-                f"\n  🎨 Генерируем "
-                f"{args.n_samples} образцов... "
-                f"(T={args.timesteps} шагов)",
-            )
-
             sample_model = (
                 ema.shadow
                 if ema is not None
-                else base_unet
+                else unwrap_model(model)
             )
 
             sample_ddpm = DDPM(
-                sample_model,
+                model=sample_model,
                 timesteps=args.timesteps,
                 schedule=args.schedule,
                 device=str(device),
@@ -619,14 +693,19 @@ def main():
 
             samples = sample_ddpm.sample(
                 n=args.n_samples,
-                img_shape=(3, 128, 128),
+                img_shape=(
+                    3,
+                    128,
+                    128,
+                ),
                 verbose=True,
             )
 
             save_sample_grid(
                 samples,
-                path=(
-                    f"{args.output_dir}/samples/"
+                (
+                    f"{args.output_dir}/"
+                    f"samples/"
                     f"gen_ep{epoch:03d}.png"
                 ),
                 nrow=4,
@@ -636,95 +715,46 @@ def main():
                 ),
             )
 
-            print(
-                f"  ✓ Образцы сохранены → "
-                f"{args.output_dir}/samples/"
-                f"gen_ep{epoch:03d}.png",
-            )
-
-        # ---------------------------------------------------------------------
-        # Checkpoint
-        # ---------------------------------------------------------------------
-
         if (
             epoch % args.save_every == 0
             or epoch == args.epochs
         ):
             state = {
                 "epoch": epoch,
-                "model": base_unet.state_dict(),
+                "model": unwrap_model(
+                    model
+                ).state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "best_loss": best_loss,
                 "args": vars(args),
             }
 
             if ema is not None:
-                state["ema"] = ema.state_dict()
+                state["ema"] = (
+                    ema.state_dict()
+                )
 
             save_checkpoint(
                 state,
                 args.output_dir,
                 filename=(
-                    f"checkpoint_ep{epoch:03d}.pt"
+                    f"checkpoint_ep"
+                    f"{epoch:03d}.pt"
                 ),
                 is_best=is_best,
             )
 
-        # ---------------------------------------------------------------------
-        # Curves
-        # ---------------------------------------------------------------------
-
-        if (
-            epoch % args.save_every == 0
-            or epoch == args.epochs
-        ):
-            vis.plot_curves(
+            visualizer.plot_curves(
                 logger.epoch_history,
                 epoch=epoch,
                 save=True,
             )
 
-    # -------------------------------------------------------------------------
-    # Final generation
-    # -------------------------------------------------------------------------
+    if is_main_process():
+        logger.close()
 
-    print(
-        "\n  🎨 Финальная генерация для постера...",
-    )
-
-    sample_model = (
-        ema.shadow
-        if ema is not None
-        else base_unet
-    )
-
-    sample_ddpm = DDPM(
-        sample_model,
-        timesteps=args.timesteps,
-        schedule=args.schedule,
-        device=str(device),
-    )
-
-    final_samples = sample_ddpm.sample(
-        n=args.n_samples,
-        verbose=True,
-    )
-
-    vis.plot_final_summary(
-        logger.epoch_history,
-        samples=final_samples,
-        extra_info=(
-            f"T={args.timesteps}, "
-            f"{args.schedule}"
-        ),
-    )
-
-    logger.close()
-
-    print(
-        f"\n✅ Обучение завершено! "
-        f"Результаты → {args.output_dir}/",
-    )
+    cleanup_distributed()
 
 
 if __name__ == "__main__":

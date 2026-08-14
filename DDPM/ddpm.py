@@ -349,20 +349,29 @@ def get_beta_schedule(
 
 def extract(
     arr: torch.Tensor,
-    t:   torch.Tensor,
+    t: torch.Tensor,
     shape: tuple,
 ) -> torch.Tensor:
     """
-    Извлекает значения из arr по индексам t и reshapes для broadcast.
+    Извлекает значения arr по индексам t.
 
-    arr:   (T,)
-    t:     (B,) — индексы
-    shape: (B, C, H, W) — целевая форма
-    Returns: (B, 1, 1, 1) для broadcast с изображением
+    В отличие от старой версии не делает:
+        GPU -> CPU -> GPU
+
+    Все операции выполняются на device текущего batch.
     """
-    out = arr.gather(-1, t.cpu()).to(t.device)
-    return out.reshape(t.shape[0], *((1,) * (len(shape) - 1)))
 
+    arr = arr.to(t.device)
+
+    out = arr.gather(
+        0,
+        t,
+    )
+
+    return out.reshape(
+        t.shape[0],
+        *((1,) * (len(shape) - 1)),
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DDPM класс
@@ -433,17 +442,43 @@ class DDPM:
 
     # ── Loss ─────────────────────────────────────────────────────────────────
 
-    def loss_fn(self, x_0: torch.Tensor) -> torch.Tensor:
+    def loss_fn(
+    self,
+    x_0: torch.Tensor,
+) -> torch.Tensor:
         """
-        Simplified DDPM loss: E[||ε - ε_θ(x_t, t)||²]
+        DDPM noise prediction loss.
 
-        Случайный t и случайный шум ε; модель предсказывает ε.
+        timestep создаётся на том же GPU,
+        на котором находится текущий batch.
         """
-        B  = x_0.size(0)
-        t  = torch.randint(0, self.timesteps, (B,), device=self.device)
-        x_t, noise = self.q_sample(x_0, t)
-        noise_pred = self.model(x_t, t)
-        return F.mse_loss(noise_pred, noise)
+
+        batch_size = x_0.size(0)
+
+        t = torch.randint(
+            0,
+            self.timesteps,
+            (
+                batch_size,
+            ),
+            device=x_0.device,
+            dtype=torch.long,
+        )
+
+        x_t, noise = self.q_sample(
+            x_0,
+            t,
+        )
+
+        noise_pred = self.model(
+            x_t,
+            t,
+        )
+
+        return F.mse_loss(
+            noise_pred,
+            noise,
+        )
 
     # ── Reverse process ───────────────────────────────────────────────────────
 
