@@ -1,7 +1,7 @@
 """
-Загрузка данных FFHQ для обучения VAE, GAN, DDPM.
+Загрузка и эффективный пайплайн данных FFHQ для VAE, GAN и DDPM.
 
-Поддерживает single-GPU и DistributedDataParallel c in-memory кэшированием.
+Поддерживает Single-GPU и DistributedDataParallel (DDP) с in-memory RAM кэшированием.
 """
 
 from __future__ import annotations
@@ -21,15 +21,15 @@ import torchvision.io as io
 from torchvision import transforms
 
 VALID_EXTENSIONS: frozenset[str] = frozenset(
-    {".png", ".jpg", ".jpeg", ".webp"}
+    {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 )
 
 
-def _scan_directory(root: Path | str) -> list[str]:
-    """Быстрое однопроходное сканирование папки через os.walk."""
+def scan_image_files(root: Path | str) -> list[str]:
+    """Однопроходное быстрое сканирование директории без рекурсивного rglob."""
     root_path = Path(root).expanduser().resolve()
     if not root_path.is_dir():
-        raise FileNotFoundError(f"Директория не найдена: {root_path}")
+        raise FileNotFoundError(f"Директория с датасетом не найдена: {root_path}")
 
     paths: list[str] = []
     for dirpath, _, filenames in os.walk(root_path):
@@ -40,31 +40,25 @@ def _scan_directory(root: Path | str) -> list[str]:
 
     if not paths:
         raise FileNotFoundError(
-            f"Изображения не найдены в {root_path}. "
-            "Убедитесь, что FFHQ thumbnails128x128 скачаны."
+            f"Изображения не найдены в {root_path}. Проверьте путь к FFHQ."
         )
 
+    # Детерминированная сортировка для совпадения сплитов между процессами DDP
     paths.sort()
     return paths
 
 
 class FFHQDataset(Dataset):
-    """
-    Высокопроизводительный датасет FFHQ 128x128.
-    
-    Поддерживает:
-    1. In-memory режим (хранение uint8 тензоров в RAM для нулевого I/O).
-    2. Прямое чтение через C++ бэкенд torchvision.io.
-    """
+    """Датасет FFHQ 128x128 с поддержкой in-memory RAM кэширования."""
 
     def __init__(
         self,
         root: str | Path | None = None,
         paths: Sequence[str] | None = None,
         split: str = "train",
-        transform: Callable[[torch.Tensor | Image.Image], torch.Tensor] | None = None,
+        transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         val_frac: float = 0.05,
-        in_memory: bool = False,
+        in_memory: bool = True,
         image_size: int = 128,
     ) -> None:
         self.transform = transform if transform is not None else self._default_transform()
@@ -74,7 +68,7 @@ class FFHQDataset(Dataset):
         if paths is not None:
             all_paths = list(paths)
         elif root is not None:
-            all_paths = _scan_directory(root)
+            all_paths = scan_image_files(root)
         else:
             raise ValueError("Необходимо передать 'root' или готовый список 'paths'.")
 
@@ -90,8 +84,6 @@ class FFHQDataset(Dataset):
         else:
             raise ValueError(f"Неизвестный split: {split!r}")
 
-        print(f"[Dataset] split={split!r}, images={len(self.paths):,}, in_memory={in_memory}")
-
         self.cached_tensors: torch.Tensor | None = None
         if self.in_memory:
             self._preload_to_ram()
@@ -106,13 +98,13 @@ class FFHQDataset(Dataset):
 
         for i, path in enumerate(self.paths):
             try:
-                # Нативное чтение через C++ libjpeg/libpng (быстрее PIL)
                 img = io.read_image(path, mode=io.ImageReadMode.RGB)
                 if img.shape[1:] != self.image_size:
-                    img = transforms.functional.resize(img, list(self.image_size), antialias=True)
+                    img = transforms.functional.resize(
+                        img, list(self.image_size), antialias=True
+                    )
                 self.cached_tensors[i] = img
             except Exception:
-                # Fallback на PIL при поврежденных заголовках
                 with Image.open(path) as pil_img:
                     pil_img = pil_img.convert("RGB").resize(self.image_size)
                     self.cached_tensors[i] = io.image.pil_to_tensor(pil_img)
@@ -150,7 +142,7 @@ class FFHQDataset(Dataset):
 
 
 def get_dataloaders(
-    data_root: str,
+    data_root: str | Path,
     batch_size: int = 64,
     num_workers: int = 2,
     val_frac: float = 0.05,
@@ -165,13 +157,8 @@ def get_dataloaders(
     DistributedSampler | None,
     DistributedSampler | None,
 ]:
-    """
-    Создаёт train/validation DataLoader с защитой от двойного сканирования диска.
-
-    При DDP batch_size является batch size на один GPU.
-    """
-    # Сканируем диск ровно 1 раз для обоих датасетов
-    all_paths = _scan_directory(data_root)
+    """Создаёт DataLoader'ы для train и val без повторного сканирования диска."""
+    all_paths = scan_image_files(data_root)
 
     train_transform = transforms.Compose(
         [
@@ -228,7 +215,6 @@ def get_dataloaders(
                 drop_last=False,
             )
 
-    # При in_memory=True данные уже в RAM, воркеры не нужны (num_workers=0 исключает IPC-оверхед)
     effective_workers = 0 if in_memory else num_workers
 
     train_loader = DataLoader(
@@ -239,7 +225,6 @@ def get_dataloaders(
         num_workers=effective_workers,
         pin_memory=pin_memory and torch.cuda.is_available(),
         persistent_workers=(effective_workers > 0),
-        prefetch_factor=2 if effective_workers > 0 else None,
         drop_last=True,
     )
 
@@ -252,16 +237,10 @@ def get_dataloaders(
             num_workers=effective_workers,
             pin_memory=pin_memory and torch.cuda.is_available(),
             persistent_workers=(effective_workers > 0),
-            prefetch_factor=2 if effective_workers > 0 else None,
             drop_last=False,
         )
         if val_ds is not None
         else None
     )
 
-    return (
-        train_loader,
-        val_loader,
-        train_sampler,
-        val_sampler,
-    )
+    return train_loader, val_loader, train_sampler, val_sampler
