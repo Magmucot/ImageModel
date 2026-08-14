@@ -1,791 +1,160 @@
-"""
-Обучение DDPM.
-
-Single GPU:
-
-    python DDPM/train.py \
-        --config configs/ddpm.yaml
-
-Multi GPU:
-
-    torchrun --standalone \
-        --nproc_per_node=4 \
-        DDPM/train.py \
-        --config configs/ddpm.yaml
-"""
+"""Обучение DDPM на 2x T4 (DDP, AMP FP16, In-Memory Dataset)."""
 
 from __future__ import annotations
 
 import argparse
-import copy
-import os
-import sys
 from pathlib import Path
-
 import torch
-import torch.optim as optim
-import yaml
-from torch.optim.lr_scheduler import (
-    CosineAnnealingLR,
-    LinearLR,
-    SequentialLR,
-)
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-from DDPM.ddpm import DDPM, UNet
+from data.dataset import get_dataloaders
+from DDPM.models import UNet
 from utils.distributed import (
     cleanup_distributed,
+    is_distributed,
     is_main_process,
-    reduce_mean,
-    seed_everything,
+    reduce_tensor,
     setup_distributed,
-    unwrap_model,
     wrap_ddp,
 )
-from utils.utils import (
-    TrainingLogger,
-    Visualizer,
-    load_checkpoint,
-    print_model_info,
-    save_checkpoint,
-    save_sample_grid,
-)
+from utils.utils import load_config, print_model_info, save_checkpoint, save_samples
 
 
-class EMA:
-    """EMA настоящей UNet-модели."""
+class GaussianDiffusion(nn.Module):
+    """Модуль расписания диффузии с сохранением тензоров в буферах устройства."""
 
     def __init__(
         self,
-        model: torch.nn.Module,
-        decay: float = 0.9999,
-    ):
-        self.decay = decay
+        timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
+    ) -> None:
+        super().__init__()
+        self.timesteps = timesteps
 
-        self.shadow = copy.deepcopy(
-            model
-        ).eval()
+        betas = torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
 
-        for parameter in self.shadow.parameters():
-            parameter.requires_grad_(False)
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
+        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
+        self.register_buffer(
+            "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod)
+        )
 
-    @torch.no_grad()
-    def update(
+    def q_sample(
         self,
-        model: torch.nn.Module,
-    ):
-        for shadow, current in zip(
-            self.shadow.parameters(),
-            model.parameters(),
-        ):
-            shadow.mul_(
-                self.decay
-            ).add_(
-                current,
-                alpha=1.0 - self.decay,
-            )
+        x_start: torch.Tensor,
+        t: torch.Tensor,
+        noise: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if noise is None:
+            noise = torch.randn_like(x_start)
 
-        for shadow, current in zip(
-            self.shadow.buffers(),
-            model.buffers(),
-        ):
-            shadow.copy_(current)
-
-    def state_dict(self):
-        return self.shadow.state_dict()
-
-    def load_state_dict(
-        self,
-        state_dict,
-    ):
-        self.shadow.load_state_dict(
-            state_dict
+        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(
+            -1, 1, 1, 1
         )
-
-
-def load_config(path: str) -> dict:
-    if not os.path.exists(path):
-        return {}
-
-    with open(
-        path,
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return yaml.safe_load(file) or {}
-
-
-def get_config_value(
-    config: dict,
-    key: str,
-    default,
-):
-    aliases = {
-        "data_root": ("data", "root"),
-        "output_dir": ("logging", "output_dir"),
-    }
-
-    if key in aliases:
-        section_name, config_key = aliases[key]
-
-        section = config.get(
-            section_name,
-            {},
-        )
-
-        if (
-            isinstance(section, dict)
-            and config_key in section
-        ):
-            return section[config_key]
-
-    for section in config.values():
-        if not isinstance(section, dict):
-            continue
-
-        if key in section:
-            return section[key]
-
-    return default
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--config",
-        default="configs/ddpm.yaml",
-    )
-
-    parser.add_argument(
-        "--data_root",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--val_frac",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--pin_memory",
-        type=lambda x: x.lower() == "true",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--base_channels",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--time_emb_dim",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--schedule",
-        choices=[
-            "cosine",
-            "linear",
-        ],
-        default=None,
-    )
-
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--grad_clip",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--warmup_epochs",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--ema_decay",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--output_dir",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--save_every",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--sample_every",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--log_every",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--n_samples",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--device",
-        default="auto",
-    )
-
-    parser.add_argument(
-        "--resume",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-    )
-
-    args = parser.parse_args()
-
-    config = load_config(
-        args.config
-    )
-
-    defaults = {
-        "data_root": "./data",
-        "val_frac": 0.05,
-        "num_workers": 4,
-        "pin_memory": True,
-        "base_channels": 64,
-        "time_emb_dim": 256,
-        "timesteps": 1000,
-        "schedule": "cosine",
-        "dropout": 0.1,
-        "epochs": 200,
-        "batch_size": 16,
-        "lr": 2e-4,
-        "weight_decay": 0.0,
-        "grad_clip": 1.0,
-        "warmup_epochs": 5,
-        "ema_decay": 0.9999,
-        "output_dir": "checkpoints/ddpm",
-        "save_every": 10,
-        "sample_every": 20,
-        "log_every": 10,
-        "n_samples": 16,
-        "seed": 42,
-    }
-
-    for key, default in defaults.items():
-        if getattr(args, key) is None:
-            setattr(
-                args,
-                key,
-                get_config_value(
-                    config,
-                    key,
-                    default,
-                ),
-            )
-
-    return args
-
-
-class DummyDataLoader:
-    def __init__(
-        self,
-        batch_size,
-        n_batches=10,
-    ):
-        self.batch_size = batch_size
-        self.n_batches = n_batches
-
-    def __len__(self):
-        return self.n_batches
-
-    def __iter__(self):
-        for _ in range(self.n_batches):
-            yield torch.randn(
-                self.batch_size,
-                3,
-                128,
-                128,
-            )
-
-
-def get_scheduler(
-    optimizer,
-    args,
-):
-    if args.warmup_epochs > 0:
-        warmup = LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=args.warmup_epochs,
-        )
-
-        cosine = CosineAnnealingLR(
-            optimizer,
-            T_max=max(
-                1,
-                args.epochs
-                - args.warmup_epochs,
-            ),
-            eta_min=args.lr * 0.01,
-        )
-
-        return SequentialLR(
-            optimizer,
-            [warmup, cosine],
-            milestones=[
-                args.warmup_epochs
-            ],
-        )
-
-    return CosineAnnealingLR(
-        optimizer,
-        T_max=args.epochs,
-        eta_min=args.lr * 0.01,
-    )
+        return sqrt_alpha * x_start + sqrt_one_minus_alpha * noise
 
 
 def train_epoch(
-    ddpm,
-    loader,
-    optimizer,
-    device,
-    args,
-    logger,
-    epoch,
-    ema,
-):
-    ddpm.model.train()
+    model: nn.Module,
+    diffusion: GaussianDiffusion,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    device: torch.device,
+) -> float:
+    model.train()
+    total_loss = 0.0
 
-    loss_sum = 0.0
-    steps = 0
+    for images in train_loader:
+        images = images.to(device, non_blocking=True)
+        batch_size = images.size(0)
+        optimizer.zero_grad(set_to_none=True)
 
-    for step, batch in enumerate(loader):
-        images = batch.to(
-            device,
-            non_blocking=True,
+        t = torch.randint(
+            0, diffusion.timesteps, (batch_size,), device=device, dtype=torch.long
         )
+        noise = torch.randn_like(images)
+        x_noisy = diffusion.q_sample(images, t, noise=noise)
 
-        optimizer.zero_grad(
-            set_to_none=True
-        )
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            predicted_noise = model(x_noisy, t)
+            loss = nn.functional.mse_loss(predicted_noise, noise)
 
-        loss = ddpm.loss_fn(
-            images
-        )
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        loss.backward()
+        total_loss += reduce_tensor(loss.detach()).item()
 
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                ddpm.model.parameters(),
-                args.grad_clip,
-            )
+    return total_loss / len(train_loader)
 
-        optimizer.step()
 
-        if ema is not None:
-            ema.update(
-                unwrap_model(
-                    ddpm.model
-                )
-            )
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/ddpm.yaml")
+    parser.add_argument("--data_root", type=str, required=True)
+    args = parser.parse_args()
 
-        loss_sum += loss.detach()
-        steps += 1
+    cfg = load_config(args.config)
+    device, local_rank = setup_distributed()
 
-        if (
-            is_main_process()
-            and (step + 1) % args.log_every == 0
-        ):
-            logger.log(
-                epoch=epoch,
-                step=step + 1,
-                mse_loss=loss.item(),
-            )
-
-    steps = max(
-        steps,
-        1,
+    train_loader, _, train_sampler, _ = get_dataloaders(
+        data_root=args.data_root,
+        batch_size=cfg.get("batch_size", 32),
+        num_workers=cfg.get("num_workers", 2),
+        val_frac=0.0,
+        distributed=is_distributed(),
+        in_memory=True,
+        image_size=cfg.get("image_size", 128),
     )
 
-    return {
-        "mse_loss": reduce_mean(
-            loss_sum / steps
-        ).item(),
-    }
+    diffusion = GaussianDiffusion(timesteps=cfg.get("timesteps", 1000)).to(device)
+    model = UNet().to(device)
+    print_model_info(model, "DDPM UNet")
 
+    model = wrap_ddp(model, local_rank)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.get("lr", 0.0002))
+    scaler = torch.amp.GradScaler("cuda")
 
-def main():
-    args = parse_args()
+    epochs = cfg.get("epochs", 100)
+    save_dir = Path(cfg.get("save_dir", "checkpoints/ddpm"))
 
-    (
-        device,
-        local_rank,
-        rank,
-        distributed,
-    ) = setup_distributed(
-        args.device
-    )
+    for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-    seed_everything(
-        args.seed,
-        rank,
-    )
-
-    if is_main_process():
-        print(
-            f"Device: {device}"
-        )
-
-        if distributed:
-            print(
-                "DDP world size:",
-                torch.distributed.get_world_size(),
-            )
-
-    if args.dry_run:
-        train_loader = DummyDataLoader(
-            args.batch_size,
-            10,
-        )
-
-        train_sampler = None
-
-        args.epochs = 2
-        args.sample_every = 2
-
-    else:
-        from data.dataset import (
-            get_dataloaders,
-        )
-
-        (
-            train_loader,
-            _,
-            train_sampler,
-            _,
-        ) = get_dataloaders(
-            data_root=args.data_root,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            val_frac=args.val_frac,
-            pin_memory=args.pin_memory,
-            distributed=distributed,
-            seed=args.seed,
-        )
-
-    base_unet = UNet(
-        img_channels=3,
-        base_channels=args.base_channels,
-        time_emb_dim=args.time_emb_dim,
-        dropout=args.dropout,
-    )
-
-    base_unet = base_unet.to(
-        device
-    )
-
-    model = wrap_ddp(
-        base_unet,
-        device,
-        local_rank,
-        distributed,
-    )
-
-    ddpm = DDPM(
-        model=model,
-        timesteps=args.timesteps,
-        schedule=args.schedule,
-        device=str(device),
-    )
-
-    if is_main_process():
-        print_model_info(
+        train_loss = train_epoch(
             model,
-            (
-                "DDPM UNet "
-                f"(base_channels="
-                f"{args.base_channels}, "
-                f"T={args.timesteps})"
-            ),
-        )
-
-    ema = None
-
-    if args.ema_decay > 0:
-        ema = EMA(
-            unwrap_model(model),
-            decay=args.ema_decay,
-        )
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    scheduler = get_scheduler(
-        optimizer,
-        args,
-    )
-
-    start_epoch = 1
-    best_loss = float("inf")
-
-    if args.resume:
-        checkpoint = load_checkpoint(
-            args.resume,
-            device=str(device),
-        )
-
-        unwrap_model(
-            model
-        ).load_state_dict(
-            checkpoint["model"]
-        )
-
-        optimizer.load_state_dict(
-            checkpoint["optimizer"]
-        )
-
-        if "scheduler" in checkpoint:
-            scheduler.load_state_dict(
-                checkpoint["scheduler"]
-            )
-
-        if (
-            ema is not None
-            and "ema" in checkpoint
-        ):
-            ema.load_state_dict(
-                checkpoint["ema"]
-            )
-
-        start_epoch = (
-            checkpoint.get(
-                "epoch",
-                0,
-            )
-            + 1
-        )
-
-        best_loss = checkpoint.get(
-            "best_loss",
-            float("inf"),
-        )
-
-    logger = None
-    visualizer = None
-
-    if is_main_process():
-        logger = TrainingLogger(
-            args.output_dir,
-            model_name="DDPM",
-        )
-
-        visualizer = Visualizer(
-            args.output_dir,
-            model_name="DDPM",
-        )
-
-    for epoch in range(
-        start_epoch,
-        args.epochs + 1,
-    ):
-        if (
-            distributed
-            and train_sampler is not None
-        ):
-            train_sampler.set_epoch(
-                epoch
-            )
-
-        metrics = train_epoch(
-            ddpm,
+            diffusion,
             train_loader,
             optimizer,
+            scaler,
             device,
-            args,
-            logger,
-            epoch,
-            ema,
         )
 
-        scheduler.step()
+        if is_main_process():
+            print(f"[Epoch {epoch:03d}/{epochs:03d}] Loss: {train_loss:.5f}")
 
-        if not is_main_process():
-            continue
-
-        logger.log_epoch(
-            epoch=epoch,
-            **metrics,
-        )
-
-        logger.print_epoch_summary(
-            epoch=epoch,
-            **metrics,
-        )
-
-        is_best = (
-            metrics["mse_loss"]
-            < best_loss
-        )
-
-        if is_best:
-            best_loss = (
-                metrics["mse_loss"]
-            )
-
-        if (
-            epoch % args.sample_every == 0
-            or epoch == args.epochs
-        ):
-            if ema is not None:
-                sample_model = ema.shadow
-            else:
-                sample_model = unwrap_model(
-                    model
+            if epoch % cfg.get("save_interval", 10) == 0 or epoch == epochs:
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "model": model,
+                        "optimizer": optimizer,
+                        "scaler": scaler,
+                        "config": cfg,
+                    },
+                    is_best=False,
+                    checkpoint_dir=save_dir,
+                    filename=f"ddpm_epoch_{epoch:03d}.pt",
                 )
-
-            sample_model.eval()
-
-            sample_ddpm = DDPM(
-                model=sample_model,
-                timesteps=args.timesteps,
-                schedule=args.schedule,
-                device=str(device),
-            )
-
-            samples = sample_ddpm.sample(
-                n=args.n_samples,
-                img_shape=(
-                    3,
-                    128,
-                    128,
-                ),
-                verbose=True,
-            )
-
-            save_sample_grid(
-                samples,
-                (
-                    f"{args.output_dir}/"
-                    f"samples/"
-                    f"gen_ep{epoch:03d}.png"
-                ),
-                nrow=4,
-                title=(
-                    f"DDPM Generated — "
-                    f"Epoch {epoch}"
-                ),
-            )
-
-        if (
-            epoch % args.save_every == 0
-            or epoch == args.epochs
-        ):
-            state = {
-                "epoch": epoch,
-                "model": unwrap_model(
-                    model
-                ).state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "best_loss": best_loss,
-                "args": vars(args),
-            }
-
-            if ema is not None:
-                state["ema"] = (
-                    ema.state_dict()
-                )
-
-            save_checkpoint(
-                state,
-                args.output_dir,
-                filename=(
-                    f"checkpoint_ep"
-                    f"{epoch:03d}.pt"
-                ),
-                is_best=is_best,
-            )
-
-            visualizer.plot_curves(
-                logger.epoch_history,
-                epoch=epoch,
-                save=True,
-            )
-
-    if is_main_process():
-        logger.close()
 
     cleanup_distributed()
 
