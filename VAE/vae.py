@@ -284,7 +284,12 @@ def vae_loss(
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+
+    if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            device = torch.nn.DataParallel(device)
+    else:
+        print(f"Device: {device}")
 
     model = VAE(latent_dim=256, beta=4.0).to(device)
 

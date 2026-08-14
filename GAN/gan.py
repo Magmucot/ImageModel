@@ -260,7 +260,12 @@ def smooth_labels(
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    
+    if torch.cuda.device_count() > 1:
+                print(f"Using {torch.cuda.device_count()} GPUs")
+                device = torch.nn.DataParallel(device)
+    else:
+        print(f"Device: {device}")
 
     latent_dim = 100
     B = 4
