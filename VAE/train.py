@@ -229,14 +229,13 @@ def main():
     # Устройство
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs")
-            device = torch.nn.DataParallel(device)
-            
     else:
         device = torch.device(args.device)
-    print(f"\n🚀 β-VAE Training | Device: {device} | β={args.beta}")
+
+    use_multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
+
+    if use_multi_gpu:
+        print(f"Using {torch.cuda.device_count()} GPUs")
 
     # ── Данные ───────────────────────────────────────────────────────────────
     if args.dry_run:

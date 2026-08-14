@@ -222,7 +222,12 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    print(f"\n🚀 DDPM Training | Device: {device} | Schedule: {args.schedule}")
+
+    use_multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
+
+    if use_multi_gpu:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+
 
     # ── Данные ────────────────────────────────────────────────────────────────
     if args.dry_run:

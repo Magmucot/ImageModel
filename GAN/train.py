@@ -201,14 +201,13 @@ def main():
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs")
-            device = torch.nn.DataParallel(device)
-
     else:
         device = torch.device(args.device)
-    print(f"\n🚀 DCGAN Training | Device: {device}")
+
+    use_multi_gpu = device.type == "cuda" and torch.cuda.device_count() > 1
+
+    if use_multi_gpu:
+        print(f"Using {torch.cuda.device_count()} GPUs")
 
     # ── Данные ────────────────────────────────────────────────────────────────
     if args.dry_run:
@@ -225,8 +224,13 @@ def main():
     # ── Модели ────────────────────────────────────────────────────────────────
     G = Generator(latent_dim=args.latent_dim, ngf=args.ngf).to(device)
     D = Discriminator(nc=3, ndf=args.ndf).to(device)
+
     G.apply(weights_init)
     D.apply(weights_init)
+
+    if use_multi_gpu:
+        G = nn.DataParallel(G)
+        D = nn.DataParallel(D)
 
     print_model_info(G, f"Generator  (latent_dim={args.latent_dim})")
     print_model_info(D, "Discriminator (Spectral Norm)")
