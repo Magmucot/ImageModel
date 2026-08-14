@@ -71,6 +71,25 @@ def get_config_value(
     key: str,
     default,
 ):
+    aliases = {
+        "data_root": ("data", "root"),
+        "output_dir": ("logging", "output_dir"),
+    }
+
+    if key in aliases:
+        section_name, config_key = aliases[key]
+
+        section = config.get(
+            section_name,
+            {},
+        )
+
+        if (
+            isinstance(section, dict)
+            and config_key in section
+        ):
+            return section[config_key]
+
     for section in config.values():
         if not isinstance(section, dict):
             continue
@@ -235,6 +254,7 @@ def parse_args():
     )
 
     defaults = {
+        "grad_clip": 0.0,
         "data_root": "./data",
         "val_frac": 0.05,
         "num_workers": 4,
@@ -242,7 +262,7 @@ def parse_args():
         "latent_dim": 100,
         "ngf": 64,
         "ndf": 64,
-        "epochs": 100,
+        "epochs": 500,
         "batch_size": 32,
         "lr_g": 2e-4,
         "lr_d": 2e-4,
@@ -343,6 +363,10 @@ def train_epoch(
             True,
         )
 
+        d_step_loss_sum = 0.0
+        d_step_dx_sum = 0.0
+        d_step_dg1_sum = 0.0
+
         for _ in range(args.n_critic):
             optimizer_d.zero_grad(
                 set_to_none=True
@@ -397,7 +421,38 @@ def train_epoch(
             ) * 0.5
 
             d_loss.backward()
+
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    args.grad_clip,
+                )
+
             optimizer_d.step()
+
+            d_step_loss_sum += d_loss.detach()
+            d_step_dx_sum += real_output.detach().mean()
+            d_step_dg1_sum += fake_output.detach().mean()
+
+        n_critic = max(
+            args.n_critic,
+            1,
+        )
+
+        d_loss = (
+            d_step_loss_sum
+            / n_critic
+        )
+
+        real_output_mean = (
+            d_step_dx_sum
+            / n_critic
+        )
+
+        fake_output_mean = (
+            d_step_dg1_sum
+            / n_critic
+        )
 
         # --------------------------------------------------------------
         # Generator
@@ -437,6 +492,13 @@ def train_epoch(
         )
 
         g_loss.backward()
+
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                generator.parameters(),
+                args.grad_clip,
+            )
+
         optimizer_g.step()
 
         set_requires_grad(
@@ -444,11 +506,13 @@ def train_epoch(
             True,
         )
 
-        d_loss_sum += d_loss.detach()
+        d_loss_sum += d_loss
         g_loss_sum += g_loss.detach()
-        dx_sum += real_output.detach().mean()
-        dg1_sum += fake_output.detach().mean()
-        dg2_sum += fake_output_for_g.detach().mean()
+        dx_sum += real_output_mean
+        dg1_sum += fake_output_mean
+        dg2_sum += (
+            fake_output_for_g.detach().mean()
+        )
 
         steps += 1
 
@@ -461,12 +525,15 @@ def train_epoch(
                 step=step + 1,
                 d_loss=d_loss.item(),
                 g_loss=g_loss.item(),
-                D_x=real_output.mean().item(),
-                D_G_z1=fake_output.mean().item(),
+                D_x=real_output_mean.item(),
+                D_G_z1=fake_output_mean.item(),
                 D_G_z2=fake_output_for_g.mean().item(),
             )
 
-    steps = max(steps, 1)
+    steps = max(
+        steps,
+        1,
+    )
 
     return {
         "d_loss": reduce_mean(
@@ -490,14 +557,18 @@ def train_epoch(
 def main():
     args = parse_args()
 
-    device, local_rank, distributed = (
-        setup_distributed(
-            args.device
-        )
+    (
+        device,
+        local_rank,
+        rank,
+        distributed,
+    ) = setup_distributed(
+        args.device
     )
 
     seed_everything(
-        args.seed
+        args.seed,
+        rank,
     )
 
     if is_main_process():

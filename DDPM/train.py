@@ -87,6 +87,12 @@ class EMA:
                 alpha=1.0 - self.decay,
             )
 
+        for shadow, current in zip(
+            self.shadow.buffers(),
+            model.buffers(),
+        ):
+            shadow.copy_(current)
+
     def state_dict(self):
         return self.shadow.state_dict()
 
@@ -116,6 +122,25 @@ def get_config_value(
     key: str,
     default,
 ):
+    aliases = {
+        "data_root": ("data", "root"),
+        "output_dir": ("logging", "output_dir"),
+    }
+
+    if key in aliases:
+        section_name, config_key = aliases[key]
+
+        section = config.get(
+            section_name,
+            {},
+        )
+
+        if (
+            isinstance(section, dict)
+            and config_key in section
+        ):
+            return section[config_key]
+
     for section in config.values():
         if not isinstance(section, dict):
             continue
@@ -177,7 +202,10 @@ def parse_args():
 
     parser.add_argument(
         "--schedule",
-        choices=["cosine", "linear"],
+        choices=[
+            "cosine",
+            "linear",
+        ],
         default=None,
     )
 
@@ -443,7 +471,10 @@ def train_epoch(
                 mse_loss=loss.item(),
             )
 
-    steps = max(steps, 1)
+    steps = max(
+        steps,
+        1,
+    )
 
     return {
         "mse_loss": reduce_mean(
@@ -455,14 +486,18 @@ def train_epoch(
 def main():
     args = parse_args()
 
-    device, local_rank, distributed = (
-        setup_distributed(
-            args.device
-        )
+    (
+        device,
+        local_rank,
+        rank,
+        distributed,
+    ) = setup_distributed(
+        args.device
     )
 
     seed_everything(
-        args.seed
+        args.seed,
+        rank,
     )
 
     if is_main_process():
@@ -507,9 +542,6 @@ def main():
             seed=args.seed,
         )
 
-    # ВАЖНО:
-    # сначала создаём обычную UNet,
-    # затем DDP оборачивает её.
     base_unet = UNet(
         img_channels=3,
         base_channels=args.base_channels,
@@ -546,13 +578,11 @@ def main():
             ),
         )
 
-    # EMA должна хранить именно UNet,
-    # а не DistributedDataParallel.
     ema = None
 
     if args.ema_decay > 0:
         ema = EMA(
-            base_unet,
+            unwrap_model(model),
             decay=args.ema_decay,
         )
 
@@ -678,11 +708,14 @@ def main():
             epoch % args.sample_every == 0
             or epoch == args.epochs
         ):
-            sample_model = (
-                ema.shadow
-                if ema is not None
-                else unwrap_model(model)
-            )
+            if ema is not None:
+                sample_model = ema.shadow
+            else:
+                sample_model = unwrap_model(
+                    model
+                )
+
+            sample_model.eval()
 
             sample_ddpm = DDPM(
                 model=sample_model,

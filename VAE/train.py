@@ -70,16 +70,24 @@ def get_config_value(
     key: str,
     default,
 ):
-    """
-    Ищет параметр во всех секциях YAML.
+    aliases = {
+        "data_root": ("data", "root"),
+        "output_dir": ("logging", "output_dir"),
+    }
 
-    Например:
+    if key in aliases:
+        section_name, config_key = aliases[key]
 
-        training:
-          batch_size: 32
+        section = config.get(
+            section_name,
+            {},
+        )
 
-    будет найден как batch_size.
-    """
+        if (
+            isinstance(section, dict)
+            and config_key in section
+        ):
+            return section[config_key]
 
     for section in config.values():
         if not isinstance(section, dict):
@@ -442,9 +450,9 @@ def val_epoch(
             )
         )
 
-        total_sum += total
-        recon_sum += recon_loss
-        kl_sum += kl_loss
+        total_sum += total.detach()
+        recon_sum += recon_loss.detach()
+        kl_sum += kl_loss.detach()
 
         steps += 1
 
@@ -466,14 +474,26 @@ def val_epoch(
 def main():
     args = parse_args()
 
-    device, local_rank, distributed = (
-        setup_distributed(
-            args.device
-        )
+    (
+        device,
+        local_rank,
+        rank,
+        distributed,
+    ) = setup_distributed(
+        args.device
     )
 
+    # ВАЖНО:
+    # rank существует только после setup_distributed().
+    #
+    # Для DDP каждый процесс получает отдельную RNG sequence:
+    # rank 0 -> seed
+    # rank 1 -> seed + 1
+    # rank 2 -> seed + 2
+    # ...
     seed_everything(
-        args.seed
+        args.seed,
+        rank,
     )
 
     if is_main_process():
