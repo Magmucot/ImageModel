@@ -1,3 +1,13 @@
+#dataset
+data/thumbnails128x128/*
+data/ffhq-dataset-v2.json
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+checkpoints/**/plots/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
