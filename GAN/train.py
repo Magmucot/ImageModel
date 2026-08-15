@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from data.dataset import get_dataloaders
-from GAN.gan import Discriminator, Generator
+from GAN.gan import Discriminator, Generator, weights_init
 from utils.distributed import (
     cleanup_distributed,
     is_main_process,
@@ -55,14 +55,14 @@ def train_epoch(
         batch_size = real_images.size(0)
         real_images = real_images.to(device, non_blocking=True)
 
-        real_labels = torch.ones((batch_size, 1), device=device)
-        fake_labels = torch.zeros((batch_size, 1), device=device)
+        real_labels = torch.ones(batch_size, device=device)
+        fake_labels = torch.zeros(batch_size, device=device)
 
         # ---------------------
         # 1. Шаг Дискриминатора
         # ---------------------
         optimizer_d.zero_grad(set_to_none=True)
-        z = torch.randn(batch_size, latent_dim, device=device)
+        z = torch.randn(batch_size, latent_dim, 1, 1, device=device)
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
             fake_images = generator(z)
@@ -126,6 +126,9 @@ def main() -> None:
         ndf=get_config_value(cfg, "ndf", 64),
     ).to(device)
 
+    generator.apply(weights_init)
+    discriminator.apply(weights_init)
+
     print_model_info(generator, "Generator")
     print_model_info(discriminator, "Discriminator")
 
@@ -151,9 +154,9 @@ def main() -> None:
 
     scaler_g = torch.amp.GradScaler("cuda")
     scaler_d = torch.amp.GradScaler("cuda")
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCELoss()
 
-    fixed_noise = torch.randn(64, latent_dim, device=device)
+    fixed_noise = torch.randn(64, latent_dim, 1, 1, device=device)
     epochs = get_config_value(cfg, "epochs", 100)
     save_dir = Path(get_config_value(cfg, "output_dir", "checkpoints/gan"))
 
@@ -192,6 +195,10 @@ def main() -> None:
                         "model": generator,
                         "optimizer": optimizer_g,
                         "config": cfg,
+                        "args": {
+                            "latent_dim": latent_dim,
+                            "ngf": get_config_value(cfg, "ngf", 64),
+                        },
                     },
                     is_best=False,
                     checkpoint_dir=save_dir,

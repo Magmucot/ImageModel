@@ -38,11 +38,11 @@ def vae_loss_fn(
     x: torch.Tensor,
     mu: torch.Tensor,
     logvar: torch.Tensor,
-    kld_weight: float = 0.00025,
+    beta: float = 4.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     recon_loss = nn.functional.mse_loss(recon_x, x, reduction="mean")
-    kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    total_loss = recon_loss + kld_weight * kld_loss
+    kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    total_loss = recon_loss + beta * kld_loss
     return total_loss, recon_loss, kld_loss
 
 
@@ -51,7 +51,7 @@ def train_epoch(
     train_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
-    kld_weight: float,
+    beta: float,
     device: torch.device,
 ) -> float:
     model.train()
@@ -63,7 +63,7 @@ def train_epoch(
 
         with torch.amp.autocast("cuda", dtype=torch.float16):
             recon, mu, logvar = model(images)
-            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, kld_weight)
+            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, beta)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -78,7 +78,7 @@ def train_epoch(
 def evaluate(
     model: nn.Module,
     val_loader: DataLoader,
-    kld_weight: float,
+    beta: float,
     device: torch.device,
 ) -> float:
     model.eval()
@@ -88,7 +88,7 @@ def evaluate(
         images = images.to(device, non_blocking=True)
         with torch.amp.autocast("cuda", dtype=torch.float16):
             recon, mu, logvar = model(images)
-            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, kld_weight)
+            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, beta)
 
         total_loss += reduce_tensor(loss.detach()).item()
 
@@ -142,7 +142,7 @@ def main() -> None:
             train_loader,
             optimizer,
             scaler,
-            get_config_value(cfg, "kld_weight", 0.00025),
+            get_config_value(cfg, "beta", 4.0),
             device,
         )
 
@@ -151,7 +151,7 @@ def main() -> None:
             val_loss = evaluate(
                 model,
                 val_loader,
-                get_config_value(cfg, "kld_weight", 0.00025),
+                get_config_value(cfg, "beta", 4.0),
                 device,
             )
 
@@ -179,6 +179,10 @@ def main() -> None:
                         "optimizer": optimizer,
                         "scaler": scaler,
                         "config": cfg,
+                        "args": {
+                            "latent_dim": latent_dim,
+                            "beta": get_config_value(cfg, "beta", 4.0),
+                        },
                     },
                     is_best=is_best,
                     checkpoint_dir=save_dir,

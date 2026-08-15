@@ -31,7 +31,9 @@ from torch.nn.parallel import (
 
 def is_distributed() -> bool:
     """Проверяет, инициализирован ли DDP."""
-    return dist.is_available() and dist.is_initialized()
+    if not dist.is_available():
+        return False
+    return dist.is_initialized()
 
 
 def get_world_size() -> int:
@@ -117,6 +119,17 @@ def setup_distributed(
     world_size = int(
         os.environ["WORLD_SIZE"]
     )
+
+    if (
+        local_rank < 0
+        or local_rank
+        >= torch.cuda.device_count()
+    ):
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank}, "
+            "доступно GPU="
+            f"{torch.cuda.device_count()}."
+        )
 
     torch.cuda.set_device(
         local_rank
