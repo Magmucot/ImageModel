@@ -1,15 +1,3 @@
-"""Обучение VAE на 2x T4 (DDP, AMP FP16, In-Memory Dataset)."""
-
-from __future__ import annotations
-
-import argparse
-from pathlib import Path
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from pathlib import Path
-import sys
 """
 Обучение VAE.
 
@@ -23,10 +11,14 @@ Single GPU:
         --config configs/vae.yaml
 """
 
-from __future__ import annotations
-
 import argparse
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.optim as optim
@@ -60,7 +52,9 @@ from VAE.vae import VAE, vae_loss
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="VAE training"
+    )
 
     parser.add_argument(
         "--config",
@@ -98,8 +92,8 @@ def parse_args():
         "beta": 4.0,
         "epochs": 50,
         "batch_size": 32,
-        "lr": 1.0e-4,
-        "weight_decay": 1.0e-5,
+        "lr": 1e-4,
+        "weight_decay": 1e-5,
         "warmup_epochs": 2,
         "grad_clip": 1.0,
         "val_frac": 0.05,
@@ -128,11 +122,7 @@ def parse_args():
         )
 
     if args.data_root is None:
-        args.data_root = get_config_value(
-            config,
-            "data_root",
-            "./data",
-        )
+        args.data_root = "./data"
 
     args.config_data = config
 
@@ -143,36 +133,39 @@ def get_scheduler(
     optimizer,
     args,
 ):
-    if args.warmup_epochs > 0:
-        warmup = LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=args.warmup_epochs,
-        )
-
-        cosine = CosineAnnealingLR(
+    if args.warmup_epochs <= 0:
+        return CosineAnnealingLR(
             optimizer,
             T_max=max(
                 1,
-                args.epochs
-                - args.warmup_epochs,
+                args.epochs,
             ),
             eta_min=args.lr * 0.01,
         )
 
-        return SequentialLR(
-            optimizer,
-            [warmup, cosine],
-            milestones=[
-                args.warmup_epochs
-            ],
-        )
-
-    return CosineAnnealingLR(
+    warmup = LinearLR(
         optimizer,
-        T_max=args.epochs,
+        start_factor=0.01,
+        end_factor=1.0,
+        total_iters=args.warmup_epochs,
+    )
+
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=max(
+            1,
+            args.epochs
+            - args.warmup_epochs,
+        ),
         eta_min=args.lr * 0.01,
+    )
+
+    return SequentialLR(
+        optimizer,
+        [warmup, cosine],
+        milestones=[
+            args.warmup_epochs
+        ],
     )
 
 
@@ -227,7 +220,11 @@ def train_epoch(
                 images
             )
 
-            total, recon_loss, kl_loss = vae_loss(
+            (
+                total,
+                recon_loss,
+                kl_loss,
+            ) = vae_loss(
                 recon,
                 images,
                 mu,
@@ -235,7 +232,9 @@ def train_epoch(
                 beta=args.beta,
             )
 
-        scaler.scale(total).backward()
+        scaler.scale(
+            total
+        ).backward()
 
         if args.grad_clip > 0:
             scaler.unscale_(
@@ -302,6 +301,13 @@ def val_epoch(
 ):
     model.eval()
 
+    if loader is None:
+        return {
+            "val_total": 0.0,
+            "val_recon": 0.0,
+            "val_kl": 0.0,
+        }
+
     total_sum = torch.zeros(
         (),
         device=device,
@@ -338,7 +344,11 @@ def val_epoch(
                 images
             )
 
-            total, recon_loss, kl_loss = vae_loss(
+            (
+                total,
+                recon_loss,
+                kl_loss,
+            ) = vae_loss(
                 recon,
                 images,
                 mu,
@@ -386,6 +396,23 @@ def main():
         args.seed,
         rank,
     )
+
+    if is_main_process():
+        print(
+            f"Device: {device}"
+        )
+
+        if distributed:
+            print(
+                "DDP world size:",
+                torch.distributed.get_world_size(),
+            )
+
+            print(
+                "Global batch size:",
+                args.batch_size
+                * torch.distributed.get_world_size(),
+            )
 
     if args.dry_run:
         args.epochs = 2
@@ -564,11 +591,18 @@ def main():
                 val_metrics["val_total"]
             )
 
-        if (
+        should_sample = (
+            epoch % args.sample_every == 0
+            or epoch == args.epochs
+        )
+
+        should_save = (
             epoch % args.save_every == 0
             or epoch == args.epochs
             or is_best
-        ):
+        )
+
+        if should_sample:
             samples = unwrap_model(
                 model
             ).sample(
@@ -578,12 +612,15 @@ def main():
 
             save_sample_grid(
                 samples,
-                Path(args.output_dir)
-                / "samples"
-                / f"epoch_{epoch:03d}.png",
+                (
+                    Path(args.output_dir)
+                    / "samples"
+                    / f"epoch_{epoch:03d}.png"
+                ),
                 nrow=8,
             )
 
+        if should_save:
             save_checkpoint(
                 {
                     "epoch": epoch,
@@ -613,172 +650,6 @@ def main():
 
     if is_main_process():
         logger.close()
-
-    cleanup_distributed()
-
-
-if __name__ == "__main__":
-    main()
-ROOT = Path(__file__).resolve().parent.parent
-
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from data.dataset import get_dataloaders
-from utils.distributed import (
-    cleanup_distributed,
-    is_distributed,
-    is_main_process,
-    reduce_tensor,
-    setup_distributed,
-    wrap_ddp,
-)
-from utils.utils import load_config, print_model_info, save_checkpoint, save_samples
-from VAE.models import VAE
-
-
-def vae_loss_fn(
-    recon_x: torch.Tensor,
-    x: torch.Tensor,
-    mu: torch.Tensor,
-    logvar: torch.Tensor,
-    kld_weight: float = 0.00025,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    recon_loss = nn.functional.mse_loss(recon_x, x, reduction="mean")
-    kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
-    total_loss = recon_loss + kld_weight * kld_loss
-    return total_loss, recon_loss, kld_loss
-
-
-def train_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    kld_weight: float,
-    device: torch.device,
-) -> float:
-    model.train()
-    total_loss = 0.0
-
-    for images in train_loader:
-        images = images.to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            recon, mu, logvar = model(images)
-            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, kld_weight)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += reduce_tensor(loss.detach()).item()
-
-    return total_loss / len(train_loader)
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    val_loader: DataLoader,
-    kld_weight: float,
-    device: torch.device,
-) -> float:
-    model.eval()
-    total_loss = 0.0
-
-    for images in val_loader:
-        images = images.to(device, non_blocking=True)
-        with torch.amp.autocast("cuda", dtype=torch.float16):
-            recon, mu, logvar = model(images)
-            loss, _, _ = vae_loss_fn(recon, images, mu, logvar, kld_weight)
-
-        total_loss += reduce_tensor(loss.detach()).item()
-
-    return total_loss / len(val_loader)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/vae.yaml")
-    parser.add_argument("--data_root", type=str, required=True)
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    device, local_rank = setup_distributed()
-
-    train_loader, val_loader, train_sampler, _ = get_dataloaders(
-        data_root=args.data_root,
-        batch_size=cfg.get("batch_size", 64),
-        num_workers=cfg.get("num_workers", 2),
-        val_frac=cfg.get("val_frac", 0.05),
-        distributed=is_distributed(),
-        in_memory=True,
-        image_size=cfg.get("image_size", 128),
-    )
-
-    model = VAE(latent_dim=cfg.get("latent_dim", 256)).to(device)
-    print_model_info(model, "VAE")
-    model = wrap_ddp(model, local_rank)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.get("lr", 0.0005))
-    scaler = torch.amp.GradScaler("cuda")
-
-    best_val_loss = float("inf")
-    epochs = cfg.get("epochs", 50)
-    save_dir = Path(cfg.get("save_dir", "checkpoints/vae"))
-
-    for epoch in range(1, epochs + 1):
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-
-        train_loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scaler,
-            cfg.get("kld_weight", 0.00025),
-            device,
-        )
-
-        val_loss = 0.0
-        if val_loader is not None:
-            val_loss = evaluate(
-                model,
-                val_loader,
-                cfg.get("kld_weight", 0.00025),
-                device,
-            )
-
-        if is_main_process():
-            print(
-                f"[Epoch {epoch:03d}/{epochs:03d}] Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}"
-            )
-
-            is_best = val_loss < best_val_loss
-            if is_best:
-                best_val_loss = val_loss
-
-            if epoch % cfg.get("save_interval", 5) == 0 or is_best:
-                model.eval()
-                with torch.no_grad():
-                    raw_model = model.module if hasattr(model, "module") else model
-                    z = torch.randn(64, cfg.get("latent_dim", 256), device=device)
-                    samples = raw_model.decode(z)
-                    save_samples(samples, f"samples/vae/epoch_{epoch:03d}.png")
-
-                save_checkpoint(
-                    {
-                        "epoch": epoch,
-                        "model": model,
-                        "optimizer": optimizer,
-                        "scaler": scaler,
-                        "config": cfg,
-                    },
-                    is_best=is_best,
-                    checkpoint_dir=save_dir,
-                )
 
     cleanup_distributed()
 
