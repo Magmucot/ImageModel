@@ -8,6 +8,14 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from data.dataset import get_dataloaders
 from utils.distributed import (
     cleanup_distributed,
