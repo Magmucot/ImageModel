@@ -11,11 +11,15 @@ Single GPU:
         --config configs/ddpm.yaml
 """
 
-from __future__ import annotations
-
 import argparse
 import copy
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.optim as optim
@@ -51,8 +55,8 @@ from utils.utils import (
 class EMA:
     def __init__(
         self,
-        model: torch.nn.Module,
-        decay: float = 0.9999,
+        model,
+        decay=0.9999,
     ):
         if not 0.0 < decay < 1.0:
             raise ValueError(
@@ -60,20 +64,17 @@ class EMA:
             )
 
         self.decay = decay
-
         self.shadow = copy.deepcopy(
             model
         ).eval()
 
-        for parameter in (
-            self.shadow.parameters()
-        ):
+        for parameter in self.shadow.parameters():
             parameter.requires_grad_(False)
 
     @torch.no_grad()
     def update(
         self,
-        model: torch.nn.Module,
+        model,
     ):
         for shadow, current in zip(
             self.shadow.parameters(),
@@ -179,11 +180,7 @@ def parse_args():
         )
 
     if args.data_root is None:
-        args.data_root = get_config_value(
-            config,
-            "data_root",
-            "./data",
-        )
+        args.data_root = "./data"
 
     args.config_data = config
 
@@ -292,12 +289,11 @@ def train_epoch(
 
         scaler.update()
 
-        if ema is not None:
-            ema.update(
-                unwrap_model(
-                    ddpm.model
-                )
+        ema.update(
+            unwrap_model(
+                ddpm.model
             )
+        )
 
         loss_sum += loss.detach()
         steps += 1
@@ -361,8 +357,6 @@ def main():
             )
 
     if args.dry_run:
-        # Для проверки инфраструктуры
-        # отключаем дорогой RAM preload.
         args.epochs = 2
         args.in_memory = False
         args.sample_every = 2
@@ -556,10 +550,7 @@ def main():
             epoch % args.sample_every == 0
             or epoch == args.epochs
         ):
-            sample_model = (
-                ema.shadow
-            )
-
+            sample_model = ema.shadow
             sample_model.eval()
 
             sample_ddpm = DDPM(
