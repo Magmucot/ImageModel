@@ -38,6 +38,7 @@ def get_world_size() -> int:
     """Количество процессов."""
     if not is_distributed():
         return 1
+
     return dist.get_world_size()
 
 
@@ -45,10 +46,12 @@ def get_rank() -> int:
     """Global rank текущего процесса."""
     if not is_distributed():
         return 0
+
     return dist.get_rank()
 
 
 def is_main_process() -> bool:
+    """True только для rank 0."""
     return get_rank() == 0
 
 
@@ -98,7 +101,7 @@ def setup_distributed(
             False,
         )
 
-    if local_rank < 0 or local_rank >= torch.cuda.device_count():
+    if not torch.cuda.is_available():
         raise RuntimeError(
             "DDP запущен, но CUDA недоступна."
         )
@@ -144,7 +147,6 @@ def setup_distributed(
 def cleanup_distributed() -> None:
     """Корректно завершает DDP."""
     if is_distributed():
-        dist.barrier()
         dist.destroy_process_group()
 
 
@@ -212,7 +214,10 @@ def unwrap_model(
     ):
         return model.module
 
-    if isinstance(model, torch.nn.DataParallel):
+    if isinstance(
+        model,
+        torch.nn.DataParallel,
+    ):
         return model.module
 
     return model
@@ -249,6 +254,8 @@ def reduce_tensor(
 def reduce_sum(
     value: torch.Tensor,
 ) -> torch.Tensor:
+    """Суммирует scalar tensor между GPU."""
+
     if not is_distributed():
         return value
 
@@ -271,11 +278,11 @@ def broadcast_object(
     if not is_distributed():
         return obj
 
-    values = [obj]
+    objects = [obj]
 
     dist.broadcast_object_list(
-        values,
+        objects,
         src=src,
     )
 
-    return values[0]
+    return objects[0]

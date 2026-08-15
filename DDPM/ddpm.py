@@ -62,13 +62,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
                 device=t.device,
                 dtype=torch.float32,
             )
-            * (
-                -math.log(10000.0)
-                / max(
-                    half_dim - 1,
-                    1,
-                )
-            )
+            * -exponent
         )
 
         embeddings = (
@@ -85,12 +79,12 @@ class SinusoidalPositionEmbeddings(nn.Module):
         )
 
         if self.dim % 2:
-            embedding = F.pad(
-                embedding,
+            embeddings = F.pad(
+                embeddings,
                 (0, 1),
             )
 
-        return embedding
+        return embeddings
 
 
 # ============================================================================
@@ -110,17 +104,7 @@ class ResNetBlock(nn.Module):
     ):
         super().__init__()
 
-        groups_1 = min(
-            8,
-            in_channels,
-        )
-
-        while (
-            in_channels % groups_1 != 0
-        ):
-            groups_1 -= 1
-
-        groups_2 = min(
+        groups = min(
             8,
             in_channels,
         )
@@ -137,14 +121,15 @@ class ResNetBlock(nn.Module):
             out_groups -= 1
 
         self.norm1 = nn.GroupNorm(
-            groups_1,
+            groups,
             in_channels,
         )
 
         self.conv1 = nn.Conv2d(
             in_channels,
             out_channels,
-            3,
+            kernel_size=3,
+            stride=1,
             padding=1,
             bias=False,
         )
@@ -169,21 +154,21 @@ class ResNetBlock(nn.Module):
         self.conv2 = nn.Conv2d(
             out_channels,
             out_channels,
-            3,
+            kernel_size=3,
+            stride=1,
             padding=1,
             bias=False,
         )
 
-        self.skip = (
-            nn.Conv2d(
+        if in_channels != out_channels:
+            self.skip = nn.Conv2d(
                 in_channels,
                 out_channels,
-                1,
+                kernel_size=1,
                 bias=False,
             )
-            if in_channels != out_channels
-            else nn.Identity()
-        )
+        else:
+            self.skip = nn.Identity()
 
         self.act = nn.SiLU()
 
@@ -205,13 +190,10 @@ class ResNetBlock(nn.Module):
             + time_emb[:, :, None, None]
         )
 
-        h = self.conv2(
-            self.dropout(
-                self.act(
-                    self.norm2(h)
-                )
-            )
-        )
+        h = self.norm2(h)
+        h = self.act(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
 
         return h + self.skip(x)
 
@@ -261,41 +243,43 @@ class SelfAttention2d(nn.Module):
         self.qkv = nn.Conv2d(
             channels,
             channels * 3,
-            1,
+            kernel_size=1,
             bias=False,
         )
 
         self.proj = nn.Conv2d(
             channels,
             channels,
-            1,
+            kernel_size=1,
         )
 
     def forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        b, c, h, w = x.shape
+        batch, channels, height, width = (
+            x.shape
+        )
 
         residual = x
 
-        qkv = self.qkv(
-            self.norm(x)
-        )
+        h = self.norm(x)
+
+        qkv = self.qkv(h)
 
         q, k, v = qkv.chunk(
             3,
             dim=1,
         )
 
-        def split_heads(
+        def to_heads(
             tensor: torch.Tensor,
         ) -> torch.Tensor:
             tensor = tensor.view(
-                b,
+                batch,
                 self.num_heads,
                 self.head_dim,
-                h * w,
+                height * width,
             )
 
             return tensor.permute(
@@ -305,17 +289,13 @@ class SelfAttention2d(nn.Module):
                 2,
             )
 
-        q = split_heads(q)
-        k = split_heads(k)
-        v = split_heads(v)
+        q = to_heads(q)
+        k = to_heads(k)
+        v = to_heads(v)
 
-        attention = torch.softmax(
-            torch.matmul(
-                q,
-                k.transpose(-2, -1),
-            )
-            * self.scale,
-            dim=-1,
+        attention = torch.matmul(
+            q,
+            k.transpose(-2, -1),
         )
 
         attention = (
@@ -333,8 +313,8 @@ class SelfAttention2d(nn.Module):
             v,
         )
 
-        output = (
-            output.permute(
+        out = (
+            out.permute(
                 0,
                 1,
                 3,
@@ -342,15 +322,15 @@ class SelfAttention2d(nn.Module):
             )
             .contiguous()
             .view(
-                b,
-                c,
-                h,
-                w,
+                batch,
+                channels,
+                height,
+                width,
             )
         )
 
         return (
-            self.proj(output)
+            self.proj(out)
             + residual
         )
 
@@ -368,8 +348,8 @@ class DownBlock(nn.Module):
         in_ch: int,
         out_ch: int,
         time_emb_dim: int,
-        use_attn: bool,
-        dropout: float,
+        use_attn: bool = False,
+        dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -396,17 +376,20 @@ class DownBlock(nn.Module):
         self.down = nn.Conv2d(
             out_ch,
             out_ch,
-            4,
-            2,
-            1,
+            kernel_size=4,
+            stride=2,
+            padding=1,
             bias=False,
         )
 
     def forward(
         self,
-        x,
-        temb,
-    ):
+        x: torch.Tensor,
+        temb: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         h = self.res1(
             x,
             temb,
@@ -431,17 +414,17 @@ class UpBlock(nn.Module):
         skip_ch: int,
         out_ch: int,
         time_emb_dim: int,
-        use_attn: bool,
-        dropout: float,
+        use_attn: bool = False,
+        dropout: float = 0.1,
     ):
         super().__init__()
 
         self.up = nn.ConvTranspose2d(
             in_ch,
             in_ch,
-            4,
-            2,
-            1,
+            kernel_size=4,
+            stride=2,
+            padding=1,
             bias=False,
         )
 
@@ -467,10 +450,10 @@ class UpBlock(nn.Module):
 
     def forward(
         self,
-        x,
-        skip,
-        temb,
-    ):
+        x: torch.Tensor,
+        skip: torch.Tensor,
+        temb: torch.Tensor,
+    ) -> torch.Tensor:
         h = self.up(x)
 
         if h.shape[-2:] != skip.shape[-2:]:
@@ -553,24 +536,27 @@ class UNet(nn.Module):
         self.init_conv = nn.Conv2d(
             img_channels,
             ch,
-            3,
+            kernel_size=3,
+            stride=1,
             padding=1,
         )
 
+        # 128 -> 64
         self.down1 = DownBlock(
             ch,
             ch * 2,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
+        # 64 -> 32
         self.down2 = DownBlock(
             ch * 2,
             ch * 4,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
         # 32 -> 16
@@ -578,8 +564,8 @@ class UNet(nn.Module):
             ch * 4,
             ch * 8,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
         # 16 -> 8.
@@ -589,8 +575,8 @@ class UNet(nn.Module):
             ch * 8,
             ch * 8,
             time_emb_dim,
-            True,
-            dropout,
+            use_attn=True,
+            dropout=dropout,
         )
 
         # Bottleneck: 8x8.
@@ -618,8 +604,8 @@ class UNet(nn.Module):
             ch * 8,
             ch * 8,
             time_emb_dim,
-            True,
-            dropout,
+            use_attn=True,
+            dropout=dropout,
         )
 
         # 16 -> 32.
@@ -628,8 +614,8 @@ class UNet(nn.Module):
             ch * 8,
             ch * 4,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
         # 32 -> 64.
@@ -638,8 +624,8 @@ class UNet(nn.Module):
             ch * 4,
             ch * 2,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
         # 64 -> 128.
@@ -648,8 +634,8 @@ class UNet(nn.Module):
             ch * 2,
             ch,
             time_emb_dim,
-            False,
-            dropout,
+            use_attn=False,
+            dropout=dropout,
         )
 
         groups = min(
@@ -670,16 +656,17 @@ class UNet(nn.Module):
             nn.Conv2d(
                 ch,
                 img_channels,
-                3,
+                kernel_size=3,
+                stride=1,
                 padding=1,
             ),
         )
 
     def forward(
         self,
-        x,
-        t,
-    ):
+        x: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
         temb = self.time_mlp(t)
 
         x = self.init_conv(x)
@@ -740,9 +727,9 @@ class UNet(nn.Module):
             temb,
         )
 
-        return self.out_conv(
-            self.out_norm(x)
-        )
+        x = self.out_norm(x)
+
+        return self.out_conv(x)
 
 
 # ============================================================================
@@ -774,10 +761,13 @@ def get_beta_schedule(
     if schedule == "cosine":
         s = 0.008
 
+        steps = timesteps + 1
+
         x = torch.linspace(
             0,
             timesteps,
-            timesteps + 1,
+            steps,
+            dtype=torch.float32,
         )
 
         alpha_bar = torch.cos(
@@ -790,7 +780,10 @@ def get_beta_schedule(
             * 0.5
         ).pow(2)
 
-        alpha_bar /= alpha_bar[0]
+        alpha_bar = (
+            alpha_bar
+            / alpha_bar[0]
+        )
 
         betas = 1.0 - (
             alpha_bar[1:]
@@ -834,10 +827,10 @@ def extract(
 
     out = arr.gather(
         0,
-        t.long(),
+        t,
     )
 
-    return values.reshape(
+    return out.reshape(
         t.shape[0],
         *(
             1
@@ -890,11 +883,16 @@ class DDPM:
         ).to(self.device)
 
         self.betas = betas
-        self.alphas = 1.0 - betas
 
-        self.alphas_cumprod = torch.cumprod(
-            self.alphas,
-            dim=0,
+        self.alphas = (
+            1.0 - betas
+        )
+
+        self.alphas_cumprod = (
+            torch.cumprod(
+                self.alphas,
+                dim=0,
+            )
         )
 
         self.alphas_cumprod_prev = F.pad(
@@ -903,15 +901,17 @@ class DDPM:
             value=1.0,
         )
 
-        self.alphas_cumprod_prev = F.pad(
-            self.alphas_cumprod[:-1],
-            (1, 0),
-            value=1.0,
+        self.sqrt_alphas_cumprod = (
+            torch.sqrt(
+                self.alphas_cumprod
+            )
         )
 
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(
-            1.0
-            - self.alphas_cumprod
+        self.sqrt_one_minus_alphas_cumprod = (
+            torch.sqrt(
+                1.0
+                - self.alphas_cumprod
+            )
         )
 
         self.sqrt_recip_alphas = (
@@ -926,29 +926,6 @@ class DDPM:
                 1.0
                 - self.alphas_cumprod_prev
             )
-            / (
-                1.0
-                - self.alphas_cumprod
-            )
-        ).clamp_min(1e-20)
-
-        self.posterior_mean_coef1 = (
-            betas
-            * torch.sqrt(
-                self.alphas_cumprod_prev
-            )
-            / (
-                1.0
-                - self.alphas_cumprod
-            )
-        )
-
-        self.posterior_mean_coef2 = (
-            (
-                1.0
-                - self.alphas_cumprod_prev
-            )
-            * torch.sqrt(self.alphas)
             / (
                 1.0
                 - self.alphas_cumprod
@@ -1008,7 +985,9 @@ class DDPM:
         """
 
         if noise is None:
-            noise = torch.randn_like(x_0)
+            noise = torch.randn_like(
+                x_0
+            )
 
         sqrt_alpha_bar = extract(
             self.sqrt_alphas_cumprod,
@@ -1073,7 +1052,7 @@ class DDPM:
     @torch.no_grad()
     def p_sample(
         self,
-        x,
+        x: torch.Tensor,
         t_idx: int,
     ) -> torch.Tensor:
         """
@@ -1164,6 +1143,10 @@ class DDPM:
             x.shape,
         )
 
+        noise = torch.randn_like(
+            x
+        )
+
         return (
             posterior_mean
             + torch.sqrt(
@@ -1179,8 +1162,12 @@ class DDPM:
     @torch.no_grad()
     def sample(
         self,
-        n: int,
-        img_shape: tuple[int, int, int],
+        n: int = 16,
+        img_shape: tuple = (
+            3,
+            128,
+            128,
+        ),
         verbose: bool = False,
         device: str | torch.device | None = None,
     ) -> torch.Tensor:
@@ -1443,12 +1430,16 @@ class DDPM:
 # ============================================================================
 
 
-        sampling_steps = min(
-            sampling_steps,
-            self.timesteps,
-        )
+if __name__ == "__main__":
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
 
-        self.model.eval()
+    print(
+        f"Device: {device}"
+    )
 
     model = UNet(
         img_channels=3,
@@ -1464,9 +1455,13 @@ class DDPM:
         device=device,
     )
 
-        time_indices = torch.unique(
-            time_indices
-        ).flip(0)
+    x = torch.randn(
+        2,
+        3,
+        128,
+        128,
+        device=device,
+    )
 
     t = torch.randint(
         0,
@@ -1475,9 +1470,10 @@ class DDPM:
         device=device,
     )
 
-        if verbose:
-            try:
-                from tqdm import tqdm
+    pred = model(
+        x,
+        t,
+    )
 
     print(
         f"Input: {tuple(x.shape)}"

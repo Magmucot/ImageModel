@@ -1,5 +1,7 @@
 """Обучение VAE на 2x T4 (DDP, AMP FP16, In-Memory Dataset)."""
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 import torch
@@ -42,14 +44,6 @@ def vae_loss_fn(
     kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
     total_loss = recon_loss + kld_weight * kld_loss
     return total_loss, recon_loss, kld_loss
-
-    return SequentialLR(
-        optimizer,
-        [warmup, cosine],
-        milestones=[
-            args.warmup_epochs
-        ],
-    )
 
 
 def train_epoch(
@@ -150,8 +144,6 @@ def main() -> None:
             scaler,
             get_config_value(cfg, "kld_weight", 0.00025),
             device,
-            args,
-            amp_enabled,
         )
 
         val_loss = 0.0

@@ -1,5 +1,7 @@
 """Обучение GAN на 2x T4 (DDP, AMP FP16, In-Memory Dataset)."""
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 import torch

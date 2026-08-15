@@ -25,8 +25,6 @@ from typing import Callable, Sequence
 from PIL import Image
 
 import torch
-import torchvision.io as io
-from PIL import Image
 from torch.utils.data import (
     DataLoader,
     Dataset,
@@ -263,134 +261,6 @@ class FFHQDataset(Dataset):
     изображения из RAM.
     """
 
-
-def scan_image_files(
-    root: str | Path,
-) -> list[str]:
-    root = Path(root).expanduser().resolve()
-
-    if not root.is_dir():
-        raise FileNotFoundError(
-            f"Dataset directory not found: {root}"
-        )
-
-    paths = []
-
-    for dirpath, _, filenames in os.walk(
-        root
-    ):
-        for filename in filenames:
-            extension = (
-                Path(filename)
-                .suffix
-                .lower()
-            )
-
-            if extension in VALID_EXTENSIONS:
-                paths.append(
-                    str(
-                        Path(dirpath)
-                        / filename
-                    )
-                )
-
-    paths.sort()
-
-    if not paths:
-        raise FileNotFoundError(
-            f"Images not found in {root}"
-        )
-
-    return paths
-
-
-def _load_image(
-    path: str,
-    image_size: int,
-) -> torch.Tensor:
-    try:
-        tensor = io.read_image(
-            path,
-            mode=io.ImageReadMode.RGB,
-        )
-
-        if tensor.ndim != 3:
-            raise ValueError(
-                f"Invalid image shape: "
-                f"{tensor.shape}"
-            )
-
-        if tensor.shape[-2:] != (
-            image_size,
-            image_size,
-        ):
-            tensor = transforms.functional.resize(
-                tensor,
-                [
-                    image_size,
-                    image_size,
-                ],
-                antialias=True,
-            )
-
-        return tensor
-
-    except Exception:
-        with Image.open(path) as image:
-            image = image.convert("RGB")
-            image = image.resize(
-                (
-                    image_size,
-                    image_size,
-                ),
-                Image.Resampling.LANCZOS,
-            )
-
-            return torch.from_numpy(
-                np.asarray(image)
-            ).permute(
-                2,
-                0,
-                1,
-            ).contiguous()
-
-
-def default_train_transform(
-    image_size: int = 128,
-):
-    return transforms.Compose(
-        [
-            transforms.RandomHorizontalFlip(
-                p=0.5
-            ),
-            transforms.ConvertImageDtype(
-                torch.float32
-            ),
-            transforms.Normalize(
-                [0.5, 0.5, 0.5],
-                [0.5, 0.5, 0.5],
-            ),
-        ]
-    )
-
-
-def default_val_transform(
-    image_size: int = 128,
-):
-    return transforms.Compose(
-        [
-            transforms.ConvertImageDtype(
-                torch.float32
-            ),
-            transforms.Normalize(
-                [0.5, 0.5, 0.5],
-                [0.5, 0.5, 0.5],
-            ),
-        ]
-    )
-
-
-class FFHQDataset(Dataset):
     def __init__(
         self,
         root: str | Path | None = None,
@@ -423,69 +293,6 @@ class FFHQDataset(Dataset):
             image_size,
         )
 
-        if not 0.0 <= val_frac < 1.0:
-            raise ValueError(
-                "val_frac должен быть в [0, 1)."
-            )
-
-        if image_size <= 0:
-            raise ValueError(
-                "image_size должен быть > 0."
-            )
-
-        if paths is None:
-            if root is None:
-                raise ValueError(
-                    "Передайте root или paths."
-                )
-
-            paths = scan_image_files(root)
-
-        all_paths = sorted(
-            list(paths)
-        )
-
-        if not all_paths:
-            raise ValueError(
-                "Dataset пуст."
-            )
-
-        n_total = len(all_paths)
-
-        n_val = (
-            max(
-                1,
-                int(
-                    n_total * val_frac
-                ),
-            )
-            if val_frac > 0
-            else 0
-        )
-
-        n_train = n_total - n_val
-
-        if n_train <= 0:
-            raise ValueError(
-                "Train split пуст."
-            )
-
-        if split == "train":
-            self.paths = all_paths[
-                :n_train
-            ]
-        elif split == "val":
-            self.paths = all_paths[
-                n_train:
-            ]
-        elif split == "all":
-            self.paths = all_paths
-        else:
-            raise ValueError(
-                f"Unknown split: {split}"
-            )
-
-        self.image_size = image_size
         self.transform = (
             transform
             if transform is not None
@@ -504,13 +311,6 @@ class FFHQDataset(Dataset):
                 root
             )
 
-            self._indices = torch.tensor(
-                [
-                    all_path_to_index[path]
-                    for path in self.paths
-                ],
-                dtype=torch.long,
-            )
         else:
             raise ValueError(
                 "Необходимо передать "
@@ -767,9 +567,6 @@ def get_dataloaders(
     ) = None
 
     if distributed:
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-
         train_sampler = DistributedSampler(
             train_ds,
             num_replicas=torch.distributed.get_world_size(),
@@ -801,12 +598,6 @@ def get_dataloaders(
             0,
             num_workers,
         )
-    )
-
-    use_pin_memory = (
-        pin_memory
-        and torch.cuda.is_available()
-    )
 
     use_pin_memory = (
         pin_memory
