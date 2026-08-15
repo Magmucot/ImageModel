@@ -1,5 +1,18 @@
 """
-DistributedDataParallel utilities.
+Утилиты для DistributedDataParallel.
+
+Поддерживает:
+
+    python VAE/train.py --config configs/vae.yaml
+
+и:
+
+    torchrun --standalone \
+        --nproc_per_node=2 \
+        VAE/train.py \
+        --config configs/vae.yaml
+
+В single-GPU режиме DDP не используется.
 """
 
 from __future__ import annotations
@@ -11,20 +24,25 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import (
+    DistributedDataParallel,
+)
 
 
 def is_distributed() -> bool:
+    """Проверяет, инициализирован ли DDP."""
     return dist.is_available() and dist.is_initialized()
 
 
 def get_world_size() -> int:
+    """Количество процессов."""
     if not is_distributed():
         return 1
     return dist.get_world_size()
 
 
 def get_rank() -> int:
+    """Global rank текущего процесса."""
     if not is_distributed():
         return 0
     return dist.get_rank()
@@ -36,44 +54,70 @@ def is_main_process() -> bool:
 
 def setup_distributed(
     device_arg: str = "auto",
-) -> tuple[torch.device, int, int, bool]:
+) -> tuple[
+    torch.device,
+    int,
+    int,
+    bool,
+]:
+    """
+    Инициализирует DDP.
+
+    Returns:
+        device:
+            GPU/CPU текущего процесса.
+
+        local_rank:
+            GPU index на текущей машине.
+
+        rank:
+            Global rank.
+
+        distributed:
+            Используется ли DDP.
+    """
+
     distributed = (
         "RANK" in os.environ
         and "WORLD_SIZE" in os.environ
-        and "LOCAL_RANK" in os.environ
     )
 
     if not distributed:
         if device_arg == "auto":
-            device = torch.device(
-                "cuda"
-                if torch.cuda.is_available()
-                else "cpu"
-            )
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
         else:
             device = torch.device(device_arg)
 
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
+        return (
+            device,
+            0,
+            0,
+            False,
+        )
 
-        return device, 0, 0, False
-
-    if not torch.cuda.is_available():
+    if local_rank < 0 or local_rank >= torch.cuda.device_count():
         raise RuntimeError(
             "DDP запущен, но CUDA недоступна."
         )
 
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(
+        os.environ["RANK"]
+    )
 
-    if local_rank < 0 or local_rank >= torch.cuda.device_count():
-        raise RuntimeError(
-            f"LOCAL_RANK={local_rank}, "
-            f"доступно GPU={torch.cuda.device_count()}."
-        )
+    local_rank = int(
+        os.environ["LOCAL_RANK"]
+    )
 
-    torch.cuda.set_device(local_rank)
+    world_size = int(
+        os.environ["WORLD_SIZE"]
+    )
+
+    torch.cuda.set_device(
+        local_rank
+    )
 
     device = torch.device(
         "cuda",
@@ -87,16 +131,25 @@ def setup_distributed(
         world_size=world_size,
     )
 
-    return device, local_rank, rank, True
+    torch.backends.cudnn.benchmark = True
+
+    return (
+        device,
+        local_rank,
+        rank,
+        True,
+    )
 
 
 def cleanup_distributed() -> None:
+    """Корректно завершает DDP."""
     if is_distributed():
         dist.barrier()
         dist.destroy_process_group()
 
 
 def barrier() -> None:
+    """Синхронизирует все процессы."""
     if is_distributed():
         dist.barrier()
 
@@ -105,14 +158,25 @@ def seed_everything(
     seed: int,
     rank: int = 0,
 ) -> None:
-    final_seed = int(seed) + int(rank)
+    """
+    Устанавливает воспроизводимый seed.
+
+    Каждый rank получает отдельную RNG sequence.
+    """
+
+    final_seed = seed + rank
 
     random.seed(final_seed)
     np.random.seed(final_seed)
-    torch.manual_seed(final_seed)
+
+    torch.manual_seed(
+        final_seed
+    )
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(final_seed)
+        torch.cuda.manual_seed_all(
+            final_seed
+        )
 
 
 def wrap_ddp(
@@ -121,6 +185,8 @@ def wrap_ddp(
     local_rank: int,
     distributed: bool,
 ) -> torch.nn.Module:
+    """Перемещает модель на GPU и при необходимости оборачивает в DDP."""
+
     model = model.to(device)
 
     if not distributed:
@@ -138,7 +204,12 @@ def wrap_ddp(
 def unwrap_model(
     model: torch.nn.Module,
 ) -> torch.nn.Module:
-    if isinstance(model, DistributedDataParallel):
+    """Возвращает настоящую модель из DDP/DataParallel."""
+
+    if isinstance(
+        model,
+        DistributedDataParallel,
+    ):
         return model.module
 
     if isinstance(model, torch.nn.DataParallel):
@@ -150,6 +221,8 @@ def unwrap_model(
 def reduce_mean(
     value: torch.Tensor,
 ) -> torch.Tensor:
+    """Усредняет scalar tensor между всеми GPU."""
+
     if not is_distributed():
         return value
 
@@ -168,6 +241,8 @@ def reduce_mean(
 def reduce_tensor(
     value: torch.Tensor,
 ) -> torch.Tensor:
+    """Alias для reduce_mean."""
+
     return reduce_mean(value)
 
 
@@ -191,6 +266,8 @@ def broadcast_object(
     obj: Any,
     src: int = 0,
 ) -> Any:
+    """Рассылает Python object всем rank."""
+
     if not is_distributed():
         return obj
 

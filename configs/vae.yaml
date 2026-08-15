@@ -20,6 +20,7 @@ data:
   val_frac: 0.05        # доля валидационных данных
   num_workers: 4        # параллельные воркеры DataLoader
   pin_memory: true
+  in_memory: false      # DDP: не дублировать полный датасет в RAM каждого процесса
 
 logging:
   save_every: 5         # сохранять чекпоинт каждые N эпох

@@ -24,6 +24,7 @@ data:
   val_frac: 0.05
   num_workers: 4
   pin_memory: true
+  in_memory: false       # DDP: не дублировать полный датасет в RAM каждого процесса
 
 logging:
   save_every: 10        # сохранять чекпоинт каждые N эпох

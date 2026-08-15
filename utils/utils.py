@@ -1,5 +1,15 @@
 """
-Общие утилиты обучения.
+Общие утилиты обучения VAE, GAN и DDPM.
+
+Поддерживает:
+
+- конфигурации YAML;
+- TrainingLogger;
+- Visualizer;
+- checkpoint save/load;
+- sample grids;
+- совместимость с DDP;
+- совместимость со старым API.
 """
 
 from __future__ import annotations
@@ -30,6 +40,8 @@ from utils.distributed import (
 def load_config(
     config_path: str | Path,
 ) -> dict[str, Any]:
+    """Загружает YAML."""
+
     path = Path(config_path)
 
     if not path.exists():
@@ -49,28 +61,59 @@ def get_config_value(
     key: str,
     default: Any = None,
 ) -> Any:
+    """
+    Ищет параметр как в старом плоском YAML,
+    так и в новом секционном YAML.
+
+    Например:
+
+        training:
+          batch_size: 16
+
+    будет доступен как:
+
+        get_config_value(
+            config,
+            "batch_size",
+        )
+    """
+
     if key in config:
         return config[key]
 
     aliases = {
-        "data_root": ("data", "root"),
-        "output_dir": ("logging", "output_dir"),
+        "data_root": (
+            "data",
+            "root",
+        ),
+        "output_dir": (
+            "logging",
+            "output_dir",
+        ),
     }
 
     if key in aliases:
-        section_name, section_key = aliases[key]
+        section_name, section_key = (
+            aliases[key]
+        )
 
         section = config.get(
             section_name,
             {},
         )
 
-        if isinstance(section, dict):
+        if isinstance(
+            section,
+            dict,
+        ):
             if section_key in section:
                 return section[section_key]
 
     for section in config.values():
-        if not isinstance(section, dict):
+        if not isinstance(
+            section,
+            dict,
+        ):
             continue
 
         if key in section:
@@ -82,6 +125,8 @@ def get_config_value(
 def count_parameters(
     model: torch.nn.Module,
 ) -> int:
+    """Количество обучаемых параметров."""
+
     return sum(
         parameter.numel()
         for parameter in model.parameters()
@@ -93,18 +138,22 @@ def print_model_info(
     model: torch.nn.Module,
     model_name: str = "Model",
 ) -> None:
+    """Печатает информацию только на rank 0."""
+
     if not is_main_process():
         return
 
     model = unwrap_model(model)
 
-    total = count_parameters(model)
+    total = count_parameters(
+        model
+    )
 
     print()
     print("=" * 64)
     print(model_name)
     print(
-        f"Обучаемых параметров: "
+        "Обучаемых параметров: "
         f"{total:,} "
         f"({total / 1e6:.2f}M)"
     )
@@ -115,8 +164,10 @@ def print_model_info(
 def denormalize(
     tensor: torch.Tensor,
 ) -> torch.Tensor:
+    """[-1, 1] -> [0, 1]."""
+
     return (
-        tensor.detach().float().cpu()
+        tensor.detach().cpu()
         + 1.0
     ) / 2.0
 
@@ -127,20 +178,20 @@ def save_sample_grid(
     nrow: int = 8,
     title: str = "",
 ) -> None:
+    """Сохраняет grid изображений."""
+
     if not is_main_process():
         return
 
     path = Path(path)
-
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    images = denormalize(images).clamp(
-        0.0,
-        1.0,
-    )
+    images = denormalize(
+        images
+    ).clamp(0.0, 1.0)
 
     vutils.save_image(
         images,
@@ -149,9 +200,9 @@ def save_sample_grid(
     )
 
     if title:
-        print(
-            f"Saved samples: {path}"
-        )
+        # Заголовок опциональный.
+        # Сам PNG уже сохранён выше.
+        pass
 
 
 def save_samples(
@@ -159,11 +210,13 @@ def save_samples(
     output_path: str | Path,
     nrow: int = 8,
     normalize: bool = True,
-    value_range: tuple[float, float] = (
-        -1.0,
-        1.0,
-    ),
+    value_range: tuple[
+        float,
+        float,
+    ] = (-1.0, 1.0),
 ) -> None:
+    """Совместимый API для новых train.py."""
+
     if not is_main_process():
         return
 
@@ -180,31 +233,15 @@ def save_samples(
     }
 
     if normalize:
-        kwargs["value_range"] = value_range
+        kwargs["value_range"] = (
+            value_range
+        )
 
     vutils.save_image(
         images.detach().cpu(),
         path,
         **kwargs,
     )
-
-
-def _state_dict_if_module(
-    value: Any,
-) -> Any:
-    if isinstance(value, torch.nn.Module):
-        return unwrap_model(value).state_dict()
-
-    return value
-
-
-def _state_dict_if_object(
-    value: Any,
-) -> Any:
-    if hasattr(value, "state_dict"):
-        return value.state_dict()
-
-    return value
 
 
 def save_checkpoint(
@@ -214,6 +251,27 @@ def save_checkpoint(
     is_best: bool = False,
     checkpoint_dir: str | Path | None = None,
 ) -> str:
+    """
+    Сохраняет checkpoint.
+
+    Поддерживает старый API:
+
+        save_checkpoint(
+            state,
+            output_dir,
+            filename,
+            is_best,
+        )
+
+    и новый:
+
+        save_checkpoint(
+            state,
+            is_best=False,
+            checkpoint_dir=...,
+        )
+    """
+
     if not is_main_process():
         return ""
 
@@ -225,50 +283,108 @@ def save_checkpoint(
 
     if directory is None:
         raise ValueError(
-            "Не указан output_dir."
+            "Не указан output_dir/checkpoint_dir."
         )
 
     directory = Path(directory)
+
     directory.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    path = (
+        directory / filename
+    )
+
     payload = dict(state)
 
-    module_keys = (
-        "model",
+    # Старый API:
+    # state["model"] = nn.Module
+    if isinstance(
+        payload.get("model"),
+        torch.nn.Module,
+    ):
+        payload["model"] = (
+            unwrap_model(
+                payload["model"]
+            ).state_dict()
+        )
+
+    # Старый GAN API может использовать
+    # model_g / model_d.
+    for key in (
         "model_g",
         "model_d",
         "generator",
         "discriminator",
-    )
+    ):
+        value = payload.get(key)
 
-    optimizer_keys = (
+        if isinstance(
+            value,
+            torch.nn.Module,
+        ):
+            payload[key] = (
+                unwrap_model(
+                    value
+                ).state_dict()
+            )
+
+    # Optimizer objects -> state_dict.
+    for key in (
         "optimizer",
         "optimizer_g",
         "optimizer_d",
         "opt_g",
         "opt_d",
         "scheduler",
-        "scaler",
-        "scaler_g",
-        "scaler_d",
+    ):
+        value = payload.get(key)
+
+        if hasattr(
+            value,
+            "state_dict",
+        ):
+            payload[key] = (
+                value.state_dict()
+            )
+
+    scaler = payload.get(
+        "scaler"
     )
 
-    for key in module_keys:
-        if key in payload:
-            payload[key] = _state_dict_if_module(
-                payload[key]
-            )
+    if hasattr(
+        scaler,
+        "state_dict",
+    ):
+        payload[
+            "scaler"
+        ] = scaler.state_dict()
 
-    for key in optimizer_keys:
-        if key in payload:
-            payload[key] = _state_dict_if_object(
-                payload[key]
-            )
+    scaler_g = payload.get(
+        "scaler_g"
+    )
 
-    path = directory / filename
+    if hasattr(
+        scaler_g,
+        "state_dict",
+    ):
+        payload[
+            "scaler_g"
+        ] = scaler_g.state_dict()
+
+    scaler_d = payload.get(
+        "scaler_d"
+    )
+
+    if hasattr(
+        scaler_d,
+        "state_dict",
+    ):
+        payload[
+            "scaler_d"
+        ] = scaler_d.state_dict()
 
     torch.save(
         payload,
@@ -288,27 +404,42 @@ def load_checkpoint(
     path: str | Path,
     device: str | torch.device = "cpu",
 ) -> dict[str, Any]:
+    """Загружает checkpoint."""
+
     path = Path(path)
 
     if not path.exists():
         raise FileNotFoundError(
-            f"Checkpoint не найден: {path}"
+            f"Чекпоинт не найден: {path}"
         )
 
-    return torch.load(
+    checkpoint = torch.load(
         path,
         map_location=device,
         weights_only=False,
     )
 
+    print(
+        f"Checkpoint loaded: {path}"
+        f" "
+        f"(epoch="
+        f"{checkpoint.get('epoch', '?')})"
+    )
+
+    return checkpoint
+
 
 class TrainingLogger:
+    """CSV + консольный лог."""
+
     def __init__(
         self,
         output_dir: str | Path,
         model_name: str = "Model",
     ):
-        self.output_dir = Path(output_dir)
+        self.output_dir = Path(
+            output_dir
+        )
 
         self.output_dir.mkdir(
             parents=True,
@@ -324,10 +455,15 @@ class TrainingLogger:
 
         self._file = None
         self._writer = None
-        self._fieldnames: list[str] = []
+        self._fieldnames = []
 
-        self.history = defaultdict(list)
-        self.epoch_history = defaultdict(list)
+        self.history = defaultdict(
+            list
+        )
+
+        self.epoch_history = defaultdict(
+            list
+        )
 
         self._start_time = time.time()
 
@@ -337,14 +473,15 @@ class TrainingLogger:
         step: int,
         **metrics: float,
     ) -> None:
+        elapsed = (
+            time.time()
+            - self._start_time
+        )
+
         row = {
             "epoch": epoch,
             "step": step,
-            "time_s": round(
-                time.time()
-                - self._start_time,
-                3,
-            ),
+            "time_s": f"{elapsed:.1f}",
             **metrics,
         }
 
@@ -360,15 +497,26 @@ class TrainingLogger:
                 encoding="utf-8",
             )
 
-            self._writer = csv.DictWriter(
-                self._file,
-                fieldnames=self._fieldnames,
-                extrasaction="ignore",
+            self._writer = (
+                csv.DictWriter(
+                    self._file,
+                    fieldnames=self._fieldnames,
+                    extrasaction="ignore",
+                )
             )
 
             self._writer.writeheader()
 
-        self._writer.writerow(row)
+        self._writer.writerow(
+            {
+                key: row.get(
+                    key,
+                    "",
+                )
+                for key in self._fieldnames
+            }
+        )
+
         self._file.flush()
 
         for key, value in metrics.items():
@@ -395,31 +543,42 @@ class TrainingLogger:
         epoch: int,
         **metrics: float,
     ) -> None:
-        values = " | ".join(
+        elapsed = (
+            time.time()
+            - self._start_time
+        )
+
+        metrics_str = " | ".join(
             f"{key}: {value:.5f}"
             for key, value in metrics.items()
         )
 
+        print()
+        print("-" * 72)
         print(
-            f"Epoch {epoch:04d} | {values}"
+            f"Epoch {epoch:04d} | "
+            f"{metrics_str} | "
+            f"{elapsed:.0f}s"
         )
+        print("-" * 72)
 
     def close(self) -> None:
         if self._file is not None:
             self._file.close()
-            self._file = None
 
 
 class Visualizer:
+    """Простая визуализация training curves."""
+
     def __init__(
         self,
         output_dir: str | Path,
         model_name: str,
         inline: bool = False,
     ):
-        self.output_dir = Path(output_dir)
-        self.model_name = model_name
-        self.inline = inline
+        self.output_dir = Path(
+            output_dir
+        )
 
         self.plots_dir = (
             self.output_dir
@@ -430,6 +589,14 @@ class Visualizer:
             parents=True,
             exist_ok=True,
         )
+
+        self.model_name = model_name
+        self.inline = inline
+
+        if not inline:
+            matplotlib.use(
+                "Agg"
+            )
 
     def plot_curves(
         self,
@@ -443,7 +610,6 @@ class Visualizer:
             for key, value
             in epoch_history.items()
             if key != "epoch"
-            and value
         }
 
         if not histories:
@@ -478,22 +644,36 @@ class Visualizer:
         ) in enumerate(
             histories.items()
         ):
-            axes[index].plot(values)
-            axes[index].set_title(
-                name
+            ax = axes[index]
+
+            ax.plot(
+                range(
+                    1,
+                    len(values) + 1,
+                ),
+                values,
             )
-            axes[index].set_xlabel(
+
+            ax.set_title(
+                name.replace(
+                    "_",
+                    " ",
+                )
+            )
+
+            ax.set_xlabel(
                 "Epoch"
             )
-            axes[index].grid(
+
+            ax.grid(
                 True,
                 alpha=0.3,
             )
 
-        for axis in axes[
+        for ax in axes[
             len(histories):
         ]:
-            axis.set_visible(False)
+            ax.set_visible(False)
 
         fig.suptitle(
             f"{self.model_name} "
@@ -512,7 +692,7 @@ class Visualizer:
 
             fig.savefig(
                 output,
-                dpi=120,
+                dpi=100,
                 bbox_inches="tight",
             )
 

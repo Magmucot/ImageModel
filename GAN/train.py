@@ -1,620 +1,200 @@
-"""
-Обучение DCGAN.
-
-Single GPU:
-    python GAN/train.py --config configs/gan.yaml
-
-2x T4:
-    torchrun --standalone \
-        --nproc_per_node=2 \
-        GAN/train.py \
-        --config configs/gan.yaml
-"""
+"""Обучение GAN на 2x T4 (DDP, AMP FP16, In-Memory Dataset)."""
 
 import argparse
-import sys
 from pathlib import Path
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
 from data.dataset import get_dataloaders
-from GAN.gan import (
-    Discriminator,
-    Generator,
-    smooth_labels,
-    weights_init,
-)
+from GAN.gan import Discriminator, Generator
 from utils.distributed import (
     cleanup_distributed,
     is_main_process,
-    reduce_mean,
-    seed_everything,
+    reduce_tensor,
     setup_distributed,
-    unwrap_model,
     wrap_ddp,
 )
 from utils.utils import (
-    TrainingLogger,
-    Visualizer,
     get_config_value,
-    load_checkpoint,
     load_config,
     print_model_info,
     save_checkpoint,
-    save_sample_grid,
+    save_samples,
 )
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--config",
-        default="configs/gan.yaml",
-    )
-
-    parser.add_argument(
-        "--data_root",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--device",
-        default="auto",
-    )
-
-    parser.add_argument(
-        "--resume",
-        default=None,
-    )
-
-    parser.add_argument(
-        "--dry_run",
-        action="store_true",
-    )
-
-    args = parser.parse_args()
-
-    config = load_config(
-        args.config
-    )
-
-    defaults = {
-        "latent_dim": 100,
-        "ngf": 64,
-        "ndf": 64,
-        "epochs": 100,
-        "batch_size": 32,
-        "lr_g": 2e-4,
-        "lr_d": 2e-4,
-        "beta1": 0.5,
-        "beta2": 0.999,
-        "label_smooth": 0.1,
-        "n_critic": 1,
-        "grad_clip": 0.0,
-        "val_frac": 0.0,
-        "num_workers": 4,
-        "pin_memory": True,
-        "save_every": 10,
-        "sample_every": 5,
-        "log_every": 20,
-        "n_samples": 64,
-        "output_dir": "checkpoints/gan",
-        "data_root": "./data",
-        "image_size": 128,
-        "in_memory": False,
-        "seed": 42,
-    }
-
-    for key, default in defaults.items():
-        setattr(
-            args,
-            key,
-            get_config_value(
-                config,
-                key,
-                default,
-            ),
-        )
-
-    if args.data_root is None:
-        args.data_root = "./data"
-
-    args.config_data = config
-
-    return args
-
-
 def train_epoch(
-    generator,
-    discriminator,
-    loader,
-    optimizer_g,
-    optimizer_d,
-    criterion,
-    scaler_g,
-    scaler_d,
-    device,
-    args,
-    logger,
-    epoch,
-    amp_enabled,
-):
+    generator: nn.Module,
+    discriminator: nn.Module,
+    train_loader: DataLoader,
+    optimizer_g: torch.optim.Optimizer,
+    optimizer_d: torch.optim.Optimizer,
+    scaler_g: torch.amp.GradScaler,
+    scaler_d: torch.amp.GradScaler,
+    criterion: nn.Module,
+    latent_dim: int,
+    device: torch.device,
+) -> tuple[float, float]:
     generator.train()
     discriminator.train()
 
-    d_sum = torch.zeros(
-        (),
-        device=device,
-    )
+    total_loss_g = 0.0
+    total_loss_d = 0.0
 
-    g_sum = torch.zeros(
-        (),
-        device=device,
-    )
+    for real_images in train_loader:
+        batch_size = real_images.size(0)
+        real_images = real_images.to(device, non_blocking=True)
 
-    steps = 0
+        real_labels = torch.ones((batch_size, 1), device=device)
+        fake_labels = torch.zeros((batch_size, 1), device=device)
 
-    for step, real in enumerate(
-        loader
-    ):
-        real = real.to(
-            device,
-            non_blocking=True,
-        )
+        # ---------------------
+        # 1. Шаг Дискриминатора
+        # ---------------------
+        optimizer_d.zero_grad(set_to_none=True)
+        z = torch.randn(batch_size, latent_dim, device=device)
 
-        batch_size = real.shape[0]
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            fake_images = generator(z)
+            d_real_out = discriminator(real_images)
+            d_fake_out = discriminator(fake_images.detach())
 
-        for _ in range(
-            max(1, args.n_critic)
-        ):
-            optimizer_d.zero_grad(
-                set_to_none=True
-            )
+            loss_d_real = criterion(d_real_out, real_labels)
+            loss_d_fake = criterion(d_fake_out, fake_labels)
+            loss_d = (loss_d_real + loss_d_fake) * 0.5
 
-            z = torch.randn(
-                batch_size,
-                args.latent_dim,
-                1,
-                1,
-                device=device,
-            )
+        scaler_d.scale(loss_d).backward()
+        scaler_d.step(optimizer_d)
+        scaler_d.update()
 
-            real_labels = smooth_labels(
-                batch_size,
-                real=True,
-                smooth=args.label_smooth,
-                device=str(device),
-            )
+        # ---------------------
+        # 2. Шаг Генератора
+        # ---------------------
+        optimizer_g.zero_grad(set_to_none=True)
 
-            fake_labels = smooth_labels(
-                batch_size,
-                real=False,
-                smooth=args.label_smooth,
-                device=str(device),
-            )
+        with torch.amp.autocast("cuda", dtype=torch.float16):
+            # Переключение requires_grad НЕ делается, чтобы не ломать reducer DDP
+            d_g_out = discriminator(fake_images)
+            loss_g = criterion(d_g_out, real_labels)
 
-            with torch.amp.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=amp_enabled,
-            ):
-                fake = generator(
-                    z
-                ).detach()
-
-                d_real = discriminator(
-                    real
-                )
-
-                d_fake = discriminator(
-                    fake
-                )
-
-                loss_d = (
-                    criterion(
-                        d_real,
-                        real_labels,
-                    )
-                    + criterion(
-                        d_fake,
-                        fake_labels,
-                    )
-                ) * 0.5
-
-            scaler_d.scale(
-                loss_d
-            ).backward()
-
-            if args.grad_clip > 0:
-                scaler_d.unscale_(
-                    optimizer_d
-                )
-
-                torch.nn.utils.clip_grad_norm_(
-                    discriminator.parameters(),
-                    args.grad_clip,
-                )
-
-            scaler_d.step(
-                optimizer_d
-            )
-
-            scaler_d.update()
-
-        optimizer_g.zero_grad(
-            set_to_none=True
-        )
-
-        z = torch.randn(
-            batch_size,
-            args.latent_dim,
-            1,
-            1,
-            device=device,
-        )
-
-        real_labels = torch.ones(
-            batch_size,
-            device=device,
-        )
-
-        for parameter in discriminator.parameters():
-            parameter.requires_grad_(False)
-
-        with torch.amp.autocast(
-            device_type=device.type,
-            dtype=torch.float16,
-            enabled=amp_enabled,
-        ):
-            fake = generator(z)
-
-            d_fake_for_g = discriminator(
-                fake
-            )
-
-            loss_g = criterion(
-                d_fake_for_g,
-                real_labels,
-            )
-
-        scaler_g.scale(
-            loss_g
-        ).backward()
-
-        if args.grad_clip > 0:
-            scaler_g.unscale_(
-                optimizer_g
-            )
-
-            torch.nn.utils.clip_grad_norm_(
-                generator.parameters(),
-                args.grad_clip,
-            )
-
-        scaler_g.step(
-            optimizer_g
-        )
-
+        scaler_g.scale(loss_g).backward()
+        scaler_g.step(optimizer_g)
         scaler_g.update()
 
-        for parameter in discriminator.parameters():
-            parameter.requires_grad_(True)
+        total_loss_g += reduce_tensor(loss_g.detach()).item()
+        total_loss_d += reduce_tensor(loss_d.detach()).item()
 
-        d_sum += loss_d.detach()
-        g_sum += loss_g.detach()
-
-        steps += 1
-
-        if (
-            is_main_process()
-            and (
-                step + 1
-            ) % args.log_every
-            == 0
-        ):
-            logger.log(
-                epoch=epoch,
-                step=step + 1,
-                d_loss=loss_d.item(),
-                g_loss=loss_g.item(),
-            )
-
-    return {
-        "d_loss": reduce_mean(
-            d_sum
-            / max(steps, 1)
-        ).item(),
-        "g_loss": reduce_mean(
-            g_sum
-            / max(steps, 1)
-        ).item(),
-    }
+    num_batches = len(train_loader)
+    return total_loss_g / num_batches, total_loss_d / num_batches
 
 
-def main():
-    args = parse_args()
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/gan.yaml")
+    parser.add_argument("--data_root", type=str, required=True)
+    args = parser.parse_args()
 
-    (
-        device,
-        local_rank,
-        rank,
-        distributed,
-    ) = setup_distributed(
-        args.device
-    )
+    cfg = load_config(args.config)
+    device, local_rank, _, distributed = setup_distributed()
 
-    seed_everything(
-        args.seed,
-        rank,
-    )
-
-    if args.dry_run:
-        args.epochs = 2
-        args.in_memory = False
-
-    (
-        train_loader,
-        _,
-        train_sampler,
-        _,
-    ) = get_dataloaders(
+    train_loader, _, train_sampler, _ = get_dataloaders(
         data_root=args.data_root,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        val_frac=args.val_frac,
-        pin_memory=args.pin_memory,
+        batch_size=get_config_value(cfg, "batch_size", 32),
+        num_workers=get_config_value(cfg, "num_workers", 4),
+        val_frac=0.0,
         distributed=distributed,
-        seed=args.seed,
-        in_memory=args.in_memory,
-        image_size=args.image_size,
+        in_memory=get_config_value(cfg, "in_memory", False),
+        image_size=get_config_value(cfg, "image_size", 128),
     )
 
+    latent_dim = get_config_value(cfg, "latent_dim", 100)
     generator = Generator(
-        latent_dim=args.latent_dim,
-        ngf=args.ngf,
-    )
-
+        latent_dim=latent_dim,
+        ngf=get_config_value(cfg, "ngf", 64),
+    ).to(device)
     discriminator = Discriminator(
-        nc=3,
-        ndf=args.ndf,
-    )
+        ndf=get_config_value(cfg, "ndf", 64),
+    ).to(device)
 
-    generator.apply(weights_init)
-    discriminator.apply(weights_init)
+    print_model_info(generator, "Generator")
+    print_model_info(discriminator, "Discriminator")
 
-    generator = wrap_ddp(
-        generator,
-        device,
-        local_rank,
-        distributed,
-    )
+    generator = wrap_ddp(generator, device, local_rank, distributed)
+    discriminator = wrap_ddp(discriminator, device, local_rank, distributed)
 
-    discriminator = wrap_ddp(
-        discriminator,
-        device,
-        local_rank,
-        distributed,
-    )
-
-    print_model_info(
-        generator,
-        "Generator",
-    )
-
-    print_model_info(
-        discriminator,
-        "Discriminator",
-    )
-
-    optimizer_g = optim.Adam(
+    optimizer_g = torch.optim.Adam(
         generator.parameters(),
-        lr=args.lr_g,
+        lr=get_config_value(cfg, "lr_g", 0.0002),
         betas=(
-            args.beta1,
-            args.beta2,
+            get_config_value(cfg, "beta1", 0.5),
+            get_config_value(cfg, "beta2", 0.999),
         ),
     )
-
-    optimizer_d = optim.Adam(
+    optimizer_d = torch.optim.Adam(
         discriminator.parameters(),
-        lr=args.lr_d,
+        lr=get_config_value(cfg, "lr_d", 0.0002),
         betas=(
-            args.beta1,
-            args.beta2,
+            get_config_value(cfg, "beta1", 0.5),
+            get_config_value(cfg, "beta2", 0.999),
         ),
     )
 
-    criterion = nn.BCELoss()
+    scaler_g = torch.amp.GradScaler("cuda")
+    scaler_d = torch.amp.GradScaler("cuda")
+    criterion = nn.BCEWithLogitsLoss()
 
-    amp_enabled = (
-        device.type == "cuda"
-    )
+    fixed_noise = torch.randn(64, latent_dim, device=device)
+    epochs = get_config_value(cfg, "epochs", 100)
+    save_dir = Path(get_config_value(cfg, "output_dir", "checkpoints/gan"))
 
-    scaler_g = torch.amp.GradScaler(
-        "cuda",
-        enabled=amp_enabled,
-    )
+    for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
-    scaler_d = torch.amp.GradScaler(
-        "cuda",
-        enabled=amp_enabled,
-    )
-
-    start_epoch = 1
-
-    if args.resume:
-        checkpoint = load_checkpoint(
-            args.resume,
-            device=device,
-        )
-
-        unwrap_model(
-            generator
-        ).load_state_dict(
-            checkpoint["generator"]
-        )
-
-        unwrap_model(
-            discriminator
-        ).load_state_dict(
-            checkpoint["discriminator"]
-        )
-
-        if "optimizer_g" in checkpoint:
-            optimizer_g.load_state_dict(
-                checkpoint["optimizer_g"]
-            )
-
-        if "optimizer_d" in checkpoint:
-            optimizer_d.load_state_dict(
-                checkpoint["optimizer_d"]
-            )
-
-        if "scaler_g" in checkpoint:
-            scaler_g.load_state_dict(
-                checkpoint["scaler_g"]
-            )
-
-        if "scaler_d" in checkpoint:
-            scaler_d.load_state_dict(
-                checkpoint["scaler_d"]
-            )
-
-        start_epoch = (
-            checkpoint.get(
-                "epoch",
-                0,
-            )
-            + 1
-        )
-
-    logger = None
-    visualizer = None
-
-    if is_main_process():
-        logger = TrainingLogger(
-            args.output_dir,
-            "GAN",
-        )
-
-        visualizer = Visualizer(
-            args.output_dir,
-            "GAN",
-        )
-
-    fixed_noise = torch.randn(
-        args.n_samples,
-        args.latent_dim,
-        1,
-        1,
-        device=device,
-    )
-
-    for epoch in range(
-        start_epoch,
-        args.epochs + 1,
-    ):
-        if (
-            distributed
-            and train_sampler is not None
-        ):
-            train_sampler.set_epoch(
-                epoch
-            )
-
-        metrics = train_epoch(
+        loss_g, loss_d = train_epoch(
             generator,
             discriminator,
             train_loader,
             optimizer_g,
             optimizer_d,
-            criterion,
             scaler_g,
             scaler_d,
+            criterion,
+            latent_dim,
             device,
-            args,
-            logger,
-            epoch,
-            amp_enabled,
         )
 
-        if not is_main_process():
-            continue
+        if is_main_process():
+            print(
+                f"[Epoch {epoch:03d}/{epochs:03d}] Loss_G: {loss_g:.4f} | Loss_D: {loss_d:.4f}"
+            )
 
-        logger.log_epoch(
-            epoch,
-            **metrics,
-        )
+            if epoch % get_config_value(cfg, "save_every", 10) == 0 or epoch == epochs:
+                generator.eval()
+                with torch.no_grad():
+                    raw_g = generator.module if hasattr(generator, "module") else generator
+                    samples = raw_g(fixed_noise)
+                    save_samples(samples, f"samples/gan/epoch_{epoch:03d}.png")
 
-        logger.print_epoch_summary(
-            epoch,
-            **metrics,
-        )
-
-        if (
-            epoch % args.sample_every == 0
-            or epoch == args.epochs
-        ):
-            generator.eval()
-
-            with torch.no_grad():
-                samples = generator(
-                    fixed_noise
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "model": generator,
+                        "optimizer": optimizer_g,
+                        "config": cfg,
+                    },
+                    is_best=False,
+                    checkpoint_dir=save_dir,
+                    filename=f"checkpoint_epoch_{epoch:03d}.pt",
                 )
-
-            save_sample_grid(
-                samples,
-                Path(args.output_dir)
-                / "samples"
-                / f"epoch_{epoch:03d}.png",
-                nrow=8,
-            )
-
-            generator.train()
-
-        if (
-            epoch % args.save_every == 0
-            or epoch == args.epochs
-        ):
-            save_checkpoint(
-                {
-                    "epoch": epoch,
-                    "generator": unwrap_model(
-                        generator
-                    ).state_dict(),
-                    "discriminator": unwrap_model(
-                        discriminator
-                    ).state_dict(),
-                    "optimizer_g": optimizer_g.state_dict(),
-                    "optimizer_d": optimizer_d.state_dict(),
-                    "scaler_g": scaler_g.state_dict(),
-                    "scaler_d": scaler_d.state_dict(),
-                    "config": args.config_data,
-                    "args": vars(args),
-                },
-                output_dir=args.output_dir,
-                filename=(
-                    f"checkpoint_ep"
-                    f"{epoch:03d}.pt"
-                ),
-            )
-
-            visualizer.plot_curves(
-                logger.epoch_history,
-                epoch,
-                save=True,
-            )
-
-    if is_main_process():
-        logger.close()
 
     cleanup_distributed()
 
