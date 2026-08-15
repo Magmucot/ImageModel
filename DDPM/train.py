@@ -37,6 +37,14 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
 )
 
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from data.dataset import get_dataloaders
 from DDPM.ddpm import DDPM, UNet
 from utils.distributed import (
