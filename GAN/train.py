@@ -11,10 +11,14 @@ Single GPU:
         --config configs/gan.yaml
 """
 
-from __future__ import annotations
-
 import argparse
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 import torch.nn as nn
@@ -121,11 +125,7 @@ def parse_args():
         )
 
     if args.data_root is None:
-        args.data_root = get_config_value(
-            config,
-            "data_root",
-            "./data",
-        )
+        args.data_root = "./data"
 
     args.config_data = config
 
@@ -171,10 +171,6 @@ def train_epoch(
         )
 
         batch_size = real.shape[0]
-
-        # ================================================================
-        # D steps
-        # ================================================================
 
         for _ in range(
             max(1, args.n_critic)
@@ -253,10 +249,6 @@ def train_epoch(
 
             scaler_d.update()
 
-        # ================================================================
-        # G step
-        # ================================================================
-
         optimizer_g.zero_grad(
             set_to_none=True
         )
@@ -274,7 +266,6 @@ def train_epoch(
             device=device,
         )
 
-        # На G-step D не должен получать градиенты.
         for parameter in discriminator.parameters():
             parameter.requires_grad_(False)
 
@@ -284,6 +275,7 @@ def train_epoch(
             enabled=amp_enabled,
         ):
             fake = generator(z)
+
             d_fake_for_g = discriminator(
                 fake
             )
@@ -335,17 +327,14 @@ def train_epoch(
                 g_loss=loss_g.item(),
             )
 
-    steps = max(
-        steps,
-        1,
-    )
-
     return {
         "d_loss": reduce_mean(
-            d_sum / steps
+            d_sum
+            / max(steps, 1)
         ).item(),
         "g_loss": reduce_mean(
-            g_sum / steps
+            g_sum
+            / max(steps, 1)
         ).item(),
     }
 
@@ -369,6 +358,7 @@ def main():
 
     if args.dry_run:
         args.epochs = 2
+        args.in_memory = False
 
     (
         train_loader,
@@ -397,13 +387,8 @@ def main():
         ndf=args.ndf,
     )
 
-    generator.apply(
-        weights_init
-    )
-
-    discriminator.apply(
-        weights_init
-    )
+    generator.apply(weights_init)
+    discriminator.apply(weights_init)
 
     generator = wrap_ddp(
         generator,
@@ -447,7 +432,6 @@ def main():
         ),
     )
 
-    # Discriminator уже содержит Sigmoid.
     criterion = nn.BCELoss()
 
     amp_enabled = (
