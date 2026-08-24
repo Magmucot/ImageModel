@@ -19,6 +19,7 @@ import torch.nn.functional as F
 # Строительные блоки
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class ResidualBlock(nn.Module):
     """
     Residual блок: Conv→GroupNorm→SiLU→Conv→GroupNorm + skip connection.
@@ -29,7 +30,7 @@ class ResidualBlock(nn.Module):
         super().__init__()
         groups = min(8, out_channels)
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels,  out_channels, 3, 1, 1, bias=False),
+            nn.Conv2d(in_channels, out_channels, 3, 1, 1, bias=False),
             nn.GroupNorm(groups, out_channels),
             nn.SiLU(),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
@@ -55,14 +56,15 @@ class SelfAttention2d(nn.Module):
 
     def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
-        assert channels % num_heads == 0, \
+        assert channels % num_heads == 0, (
             f"channels ({channels}) должен делиться на num_heads ({num_heads})"
+        )
         self.num_heads = num_heads
-        self.head_dim  = channels // num_heads
-        self.scale     = self.head_dim ** -0.5
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim**-0.5
 
         self.norm = nn.GroupNorm(min(8, channels), channels)
-        self.qkv  = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         self.proj = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -71,8 +73,8 @@ class SelfAttention2d(nn.Module):
         x = self.norm(x)
 
         # Проекции Q, K, V
-        qkv = self.qkv(x)                          # (B, 3C, H, W)
-        q, k, v = qkv.chunk(3, dim=1)              # каждый (B, C, H, W)
+        qkv = self.qkv(x)  # (B, 3C, H, W)
+        q, k, v = qkv.chunk(3, dim=1)  # каждый (B, C, H, W)
 
         def to_heads(t: torch.Tensor) -> torch.Tensor:
             # (B, C, H, W) → (B, heads, H*W, head_dim)
@@ -86,7 +88,7 @@ class SelfAttention2d(nn.Module):
         attn = attn.softmax(dim=-1)
 
         # Взвешенная сумма значений
-        out = torch.matmul(attn, v)                 # (B, heads, H*W, head_dim)
+        out = torch.matmul(attn, v)  # (B, heads, H*W, head_dim)
         out = out.permute(0, 1, 3, 2).contiguous()  # (B, heads, head_dim, H*W)
         out = out.view(B, C, H, W)
 
@@ -96,6 +98,7 @@ class SelfAttention2d(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Энкодер / Декодер
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def _enc_block(in_ch: int, out_ch: int) -> nn.Sequential:
     """Энкодер-блок: DownConv → ResBlock."""
@@ -120,6 +123,7 @@ def _dec_block(in_ch: int, out_ch: int) -> nn.Sequential:
 # ─────────────────────────────────────────────────────────────────────────────
 # β-VAE
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class VAE(nn.Module):
     """
@@ -146,30 +150,30 @@ class VAE(nn.Module):
         """
         super().__init__()
         self.latent_dim = latent_dim
-        self.beta       = beta
+        self.beta = beta
 
         # ── Энкодер ──────────────────────────────────────────────────────────
-        self.enc1 = _enc_block(3,   64)    # 128 → 64
-        self.enc2 = _enc_block(64,  128)   # 64  → 32
-        self.enc3 = _enc_block(128, 256)   # 32  → 16
-        self.enc4 = _enc_block(256, 512)   # 16  → 8
-        self.enc4_attn = SelfAttention2d(512, num_heads=4)   # attention на 8×8
-        self.enc5 = _enc_block(512, 512)   # 8   → 4
-        self.enc6 = _enc_block(512, 512)   # 4   → 2
+        self.enc1 = _enc_block(3, 64)  # 128 → 64
+        self.enc2 = _enc_block(64, 128)  # 64  → 32
+        self.enc3 = _enc_block(128, 256)  # 32  → 16
+        self.enc4 = _enc_block(256, 512)  # 16  → 8
+        self.enc4_attn = SelfAttention2d(512, num_heads=4)  # attention на 8×8
+        self.enc5 = _enc_block(512, 512)  # 8   → 4
+        self.enc6 = _enc_block(512, 512)  # 4   → 2
 
         # Bottleneck → μ, log σ²
-        self.fc_mu     = nn.Linear(512 * 2 * 2, latent_dim)
+        self.fc_mu = nn.Linear(512 * 2 * 2, latent_dim)
         self.fc_logvar = nn.Linear(512 * 2 * 2, latent_dim)
 
         # ── Декодер ──────────────────────────────────────────────────────────
         self.decoder_fc = nn.Linear(latent_dim, 512 * 2 * 2)
 
-        self.dec6 = _dec_block(512, 512)   # 2  → 4
-        self.dec5 = _dec_block(512, 512)   # 4  → 8
-        self.dec4 = _dec_block(512, 256)   # 8  → 16
-        self.dec4_attn = SelfAttention2d(256, num_heads=4)   # attention на 16×16
-        self.dec3 = _dec_block(256, 128)   # 16 → 32
-        self.dec2 = _dec_block(128, 64)    # 32 → 64
+        self.dec6 = _dec_block(512, 512)  # 2  → 4
+        self.dec5 = _dec_block(512, 512)  # 4  → 8
+        self.dec4 = _dec_block(512, 256)  # 8  → 16
+        self.dec4_attn = SelfAttention2d(256, num_heads=4)  # attention на 16×16
+        self.dec3 = _dec_block(256, 128)  # 16 → 32
+        self.dec2 = _dec_block(128, 64)  # 32 → 64
 
         # Финальный апсэмплинг 64 → 128
         self.dec1 = nn.Sequential(
@@ -230,8 +234,8 @@ class VAE(nn.Module):
             logvar: log-дисперсия q(z|x)
         """
         mu, logvar = self.encode(x)
-        z          = self.reparameterize(mu, logvar)
-        recon      = self.decode(z)
+        z = self.reparameterize(mu, logvar)
+        recon = self.decode(z)
         return recon, mu, logvar
 
     @torch.no_grad()
@@ -245,12 +249,13 @@ class VAE(nn.Module):
 # Функция потерь
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def vae_loss(
     recon_x: torch.Tensor,
-    x:       torch.Tensor,
-    mu:      torch.Tensor,
-    logvar:  torch.Tensor,
-    beta:    float = 4.0,
+    x: torch.Tensor,
+    mu: torch.Tensor,
+    logvar: torch.Tensor,
+    beta: float = 4.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     β-VAE Loss = Reconstruction Loss + β · KL Divergence.
@@ -284,12 +289,7 @@ def vae_loss(
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs")
-            device = torch.nn.DataParallel(device)
-    else:
-        print(f"Device: {device}")
+    print(f"Device: {device}")
 
     model = VAE(latent_dim=256, beta=4.0).to(device)
 
@@ -302,11 +302,15 @@ if __name__ == "__main__":
     print(f"Recon:     {recon.shape}")
     print(f"Mu:        {mu.shape}")
     print(f"Logvar:    {logvar.shape}")
-    print(f"Loss:      total={total.item():.4f}  recon={recon_l.item():.4f}  kl={kl_l.item():.4f}")
+    print(
+        f"Loss:      total={total.item():.4f}  recon={recon_l.item():.4f}  kl={kl_l.item():.4f}"
+    )
 
     # Проверка генерации
     samples = model.sample(n=4, device=str(device))
-    print(f"Samples:   {samples.shape}  min={samples.min():.3f}  max={samples.max():.3f}")
+    print(
+        f"Samples:   {samples.shape}  min={samples.min():.3f}  max={samples.max():.3f}"
+    )
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Параметров: {total_params:,}  ({total_params / 1e6:.2f}M)")

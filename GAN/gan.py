@@ -18,6 +18,7 @@ import torch.nn as nn
 # Строительные блоки
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class SelfAttention2d(nn.Module):
     """
     Multi-head Self-Attention для 2D feature maps.
@@ -28,11 +29,11 @@ class SelfAttention2d(nn.Module):
         super().__init__()
         assert channels % num_heads == 0
         self.num_heads = num_heads
-        self.head_dim  = channels // num_heads
-        self.scale     = self.head_dim ** -0.5
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim**-0.5
 
         self.norm = nn.GroupNorm(min(8, channels), channels)
-        self.qkv  = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
         self.proj = nn.Conv2d(channels, channels, 1)
         # Гамма = 0 → сначала модуль — identity, постепенно включается
         self.gamma = nn.Parameter(torch.zeros(1))
@@ -52,8 +53,8 @@ class SelfAttention2d(nn.Module):
         q, k, v = to_heads(q), to_heads(k), to_heads(v)
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-        out  = torch.matmul(attn, v)
-        out  = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
 
         return self.proj(out) * self.gamma + residual
 
@@ -61,6 +62,7 @@ class SelfAttention2d(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Generator
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class Generator(nn.Module):
     """
@@ -95,15 +97,15 @@ class Generator(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.up1 = up_block(ngf * 16, ngf * 8)    # 4  → 8
-        self.up2 = up_block(ngf * 8,  ngf * 4)    # 8  → 16
-        self.up3 = up_block(ngf * 4,  ngf * 2)    # 16 → 32
-        self.up4 = up_block(ngf * 2,  ngf)         # 32 → 64
+        self.up1 = up_block(ngf * 16, ngf * 8)  # 4  → 8
+        self.up2 = up_block(ngf * 8, ngf * 4)  # 8  → 16
+        self.up3 = up_block(ngf * 4, ngf * 2)  # 16 → 32
+        self.up4 = up_block(ngf * 2, ngf)  # 32 → 64
 
         # Self-Attention на 64×64
         self.attn = SelfAttention2d(ngf, num_heads=4)
 
-        self.up5 = up_block(ngf, ngf // 2)         # 64  → 128
+        self.up5 = up_block(ngf, ngf // 2)  # 64  → 128
 
         # Финальный слой 128 → 128 (без стрaйда, рафинирование)
         self.out_conv = nn.Sequential(
@@ -123,7 +125,7 @@ class Generator(nn.Module):
         h = self.up2(h)
         h = self.up3(h)
         h = self.up4(h)
-        h = self.attn(h)   # глобальная согласованность на 64×64
+        h = self.attn(h)  # глобальная согласованность на 64×64
         h = self.up5(h)
         return self.out_conv(h)
 
@@ -138,6 +140,7 @@ class Generator(nn.Module):
 # Discriminator
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 class Discriminator(nn.Module):
     """
     Дискриминатор DCGAN со Spectral Normalization.
@@ -147,6 +150,9 @@ class Discriminator(nn.Module):
       - Предотвращает взрыв градиентов
       - Снижает вероятность mode collapse
 
+    Выход — логиты (без Sigmoid): для обучения используется
+    BCEWithLogitsLoss, который безопасен под AMP autocast.
+
     Архитектура:
         3   × 128 × 128
         → ndf   × 64 × 64
@@ -155,51 +161,44 @@ class Discriminator(nn.Module):
         → ndf*8 × 8  × 8
         → ndf*8 × 4  × 4
         → ndf*8 × 2  × 2
-        → 1     × 1  × 1   (Sigmoid)
+        → 1     × 1  × 1   (логит)
     """
 
     def __init__(self, nc: int = 3, ndf: int = 64):
         super().__init__()
 
         def sn_conv(in_c, out_c, k=4, s=2, p=1):
-            """Conv2d со Spectral Norm."""
-            return nn.utils.spectral_norm(
-                nn.Conv2d(in_c, out_c, k, s, p, bias=False)
-            )
+            """Conv2d: инициализация весов до обёртки в Spectral Norm."""
+            conv = nn.Conv2d(in_c, out_c, k, s, p, bias=False)
+            weights_init(conv)
+            return nn.utils.spectral_norm(conv)
 
         self.main = nn.Sequential(
             # 3 × 128 × 128 → ndf × 64 × 64
             sn_conv(nc, ndf),
             nn.LeakyReLU(0.2, inplace=True),
-
             # ndf × 64 × 64 → ndf*2 × 32 × 32
             sn_conv(ndf, ndf * 2),
             nn.BatchNorm2d(ndf * 2),
             nn.LeakyReLU(0.2, inplace=True),
-
             # ndf*2 × 32 × 32 → ndf*4 × 16 × 16
             sn_conv(ndf * 2, ndf * 4),
             nn.BatchNorm2d(ndf * 4),
             nn.LeakyReLU(0.2, inplace=True),
-
             # ndf*4 × 16 × 16 → ndf*8 × 8 × 8
             sn_conv(ndf * 4, ndf * 8),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
-
             # ndf*8 × 8 × 8 → ndf*8 × 4 × 4
             sn_conv(ndf * 8, ndf * 8),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
-
             # ndf*8 × 4 × 4 → ndf*8 × 2 × 2
             sn_conv(ndf * 8, ndf * 8),
             nn.BatchNorm2d(ndf * 8),
             nn.LeakyReLU(0.2, inplace=True),
-
-            # ndf*8 × 2 × 2 → 1 × 1 × 1
+            # ndf*8 × 2 × 2 → 1 × 1 × 1 (логит)
             sn_conv(ndf * 8, 1, k=2, s=1, p=0),
-            nn.Sigmoid(),
         )
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
@@ -207,7 +206,7 @@ class Discriminator(nn.Module):
         Args:
             img: (B, 3, 128, 128) — реальное или фейковое изображение
         Returns:
-            (B,) — вероятность "реального" для каждого изображения
+            (B,) — логит "реальности" для каждого изображения
         """
         return self.main(img).view(-1)
 
@@ -216,18 +215,24 @@ class Discriminator(nn.Module):
 # Инициализация весов
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def weights_init(m: nn.Module) -> None:
     """
     Инициализация весов DCGAN согласно оригинальной статье:
       Conv   → N(0, 0.02)
       BN     → N(1, 0.02), bias=0
+
+    Для conv, обёрнутых в spectral_norm, запись идёт напрямую
+    в weight_orig (m.weight — это property, доступная только
+    для чтения по значению).
     """
     classname = m.__class__.__name__
     if "Conv" in classname and not isinstance(m, SelfAttention2d):
-        try:
-            nn.init.normal_(m.weight.data, 0.0, 0.02)
-        except AttributeError:
-            pass
+        weight = getattr(m, "weight_orig", None)
+        if weight is None:
+            weight = getattr(m, "weight", None)
+        if weight is not None:
+            nn.init.normal_(weight.data, 0.0, 0.02)
     elif "BatchNorm" in classname:
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0.0)
@@ -236,6 +241,7 @@ def weights_init(m: nn.Module) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Label smoothing helper
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def smooth_labels(
     size: int,
@@ -260,12 +266,7 @@ def smooth_labels(
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    if torch.cuda.device_count() > 1:
-                print(f"Using {torch.cuda.device_count()} GPUs")
-                device = torch.nn.DataParallel(device)
-    else:
-        print(f"Device: {device}")
+    print(f"Device: {device}")
 
     latent_dim = 100
     B = 4
@@ -290,7 +291,7 @@ if __name__ == "__main__":
     print(f"Discriminator параметров: {n_D:,}  ({n_D / 1e6:.2f}M)")
 
     # Пример label smoothing
-    real_labels = smooth_labels(B, real=True,  device=str(device))
+    real_labels = smooth_labels(B, real=True, device=str(device))
     fake_labels = smooth_labels(B, real=False, device=str(device))
     print(f"Real labels: {real_labels.tolist()}")
     print(f"Fake labels: {fake_labels.tolist()}")

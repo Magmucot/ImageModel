@@ -457,6 +457,7 @@ def train_epoch(
     logger,
     epoch: int,
     ema: EMA | None,
+    amp_enabled: bool,
 ):
     ddpm.model.train()
 
@@ -479,9 +480,14 @@ def train_epoch(
             set_to_none=True
         )
 
-        loss = ddpm.loss_fn(
-            images
-        )
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            loss = ddpm.loss_fn(
+                images
+            )
 
         scaler.scale(
             loss
@@ -665,6 +671,10 @@ def main():
         ),
     )
 
+    amp_enabled = (
+        device.type == "cuda"
+    )
+
     start_epoch = 1
     best_loss = float("inf")
 
@@ -795,6 +805,7 @@ def main():
             logger,
             epoch,
             ema,
+            amp_enabled,
         )
 
         scheduler.step()
@@ -847,12 +858,22 @@ def main():
 
             with torch.no_grad():
                 samples = (
-                    sample_ddpm.sample(
+                    sample_ddpm.ddim_sample(
                         n=args.n_samples,
                         img_shape=(
                             3,
                             args.image_size,
                             args.image_size,
+                        ),
+                        sampling_steps=get_config_value(
+                            args.config_data,
+                            "sampling_steps",
+                            50,
+                        ),
+                        eta=get_config_value(
+                            args.config_data,
+                            "sampling_eta",
+                            0.0,
                         ),
                         verbose=True,
                     )

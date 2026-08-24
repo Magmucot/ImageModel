@@ -34,8 +34,7 @@ class TrainingScriptTests(unittest.TestCase):
             imported_names = {
                 alias.name
                 for node in ast.walk(tree)
-                if isinstance(node, ast.ImportFrom)
-                and node.module == "utils.utils"
+                if isinstance(node, ast.ImportFrom) and node.module == "utils.utils"
                 for alias in node.names
             }
             self.assertIn("get_config_value", imported_names, relative_path)
@@ -74,7 +73,9 @@ class TrainingScriptTests(unittest.TestCase):
                 and node.func.id == "wrap_ddp"
             ]
             self.assertTrue(wrap_calls, relative_path)
-            self.assertTrue(all(len(call.args) == 4 for call in wrap_calls), relative_path)
+            self.assertTrue(
+                all(len(call.args) == 4 for call in wrap_calls), relative_path
+            )
 
     def test_vae_and_gan_do_not_force_per_process_memory_cache(self) -> None:
         for relative_path in ("VAE/train.py", "GAN/train.py"):
@@ -106,7 +107,12 @@ class TrainingScriptTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "should_sample"
         )
         namespace: dict[str, object] = {}
-        exec(compile(ast.Module(body=[function], type_ignores=[]), "DDPM/train.py", "exec"), namespace)
+        exec(
+            compile(
+                ast.Module(body=[function], type_ignores=[]), "DDPM/train.py", "exec"
+            ),
+            namespace,
+        )
         should_sample = namespace["should_sample"]
 
         self.assertFalse(should_sample(2, 2, 2, True))
@@ -121,7 +127,10 @@ class TrainingScriptTests(unittest.TestCase):
             node.value
             for node in ast.walk(tree)
             if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == "defaults" for target in node.targets)
+            and any(
+                isinstance(target, ast.Name) and target.id == "defaults"
+                for target in node.targets
+            )
             and isinstance(node.value, ast.Dict)
         )
         default_values = {
@@ -138,8 +147,107 @@ class TrainingScriptTests(unittest.TestCase):
             and isinstance(node.func, ast.Name)
             and node.func.id == "get_dataloaders"
         )
-        in_memory = next(keyword.value for keyword in loader_call.keywords if keyword.arg == "in_memory")
+        in_memory = next(
+            keyword.value
+            for keyword in loader_call.keywords
+            if keyword.arg == "in_memory"
+        )
         self.assertEqual("args.in_memory", ast.unparse(in_memory))
+
+    def test_no_data_parallel_device_misuse(self) -> None:
+        """Regression: torch.nn.DataParallel(device) вместо модуля."""
+        for relative_path in ("VAE/vae.py", "GAN/gan.py", "infer/infer.py"):
+            tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
+            bad_calls = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "DataParallel"
+            ]
+            self.assertEqual([], bad_calls, relative_path)
+
+    def test_gan_does_not_use_bce_loss(self) -> None:
+        """Regression: BCELoss под autocast запрещён PyTorch; нужен BCEWithLogitsLoss."""
+        source = (ROOT / "GAN/train.py").read_text(encoding="utf-8")
+        self.assertNotIn("BCELoss(", source)
+        self.assertIn("BCEWithLogitsLoss()", source)
+
+        gan_tree = ast.parse(source)
+        criterion_assigns = [
+            node
+            for node in ast.walk(gan_tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "criterion" for t in node.targets
+            )
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Attribute)
+        ]
+        self.assertTrue(criterion_assigns)
+        for node in criterion_assigns:
+            self.assertEqual("BCEWithLogitsLoss", node.value.func.attr)
+
+    def test_gan_discriminator_has_no_sigmoid(self) -> None:
+        """Discriminator выдаёт логиты для BCEWithLogitsLoss — Sigmoid не нужен."""
+        tree = ast.parse((ROOT / "GAN/gan.py").read_text(encoding="utf-8"))
+        discriminator = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "Discriminator"
+        )
+        sigmoid_calls = [
+            node
+            for node in ast.walk(discriminator)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Sigmoid"
+        ]
+        self.assertEqual([], sigmoid_calls)
+
+    def test_utils_provides_compare_models(self) -> None:
+        """Regression: infer/infer.py импортирует compare_models из utils.utils."""
+        source = (ROOT / "utils/utils.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        functions = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertIn("compare_models", functions)
+
+        infer_source = (ROOT / "infer/infer.py").read_text(encoding="utf-8")
+        infer_tree = ast.parse(infer_source)
+        imported = {
+            alias.name
+            for node in ast.walk(infer_tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "utils.utils"
+            for alias in node.names
+        }
+        self.assertIn("compare_models", imported)
+
+    def test_gan_train_uses_unwrapped_modules_across_ddp(self) -> None:
+        """Regression DDP: в шаге D используется raw_generator, в шаге G — raw_discriminator."""
+        tree = ast.parse((ROOT / "GAN/train.py").read_text(encoding="utf-8"))
+        train_epoch = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "train_epoch"
+        )
+        calls = [
+            node.func.id
+            for node in ast.walk(train_epoch)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "unwrap_model"
+        ]
+        self.assertEqual(2, len(calls))
+
+    def test_gan_supports_label_smooth_and_n_critic(self) -> None:
+        """Конфиг-параметры label_smooth и n_critic должны читаться кодом."""
+        source = (ROOT / "GAN/train.py").read_text(encoding="utf-8")
+        self.assertIn('"label_smooth"', source)
+        self.assertIn('"n_critic"', source)
 
 
 if __name__ == "__main__":

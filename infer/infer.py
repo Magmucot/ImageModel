@@ -39,6 +39,7 @@ from utils.utils import (
 # Аргументы
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Инференс для VAE / GAN / DDPM",
@@ -48,39 +49,55 @@ def parse_args() -> argparse.Namespace:
 
     # Режим работы
     mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--model",   type=str, choices=["vae", "gan", "ddpm"],
-                      help="выбор одной модели для генерации")
-    mode.add_argument("--compare", action="store_true",
-                      help="сравнительный постер всех трёх моделей")
+    mode.add_argument(
+        "--model",
+        type=str,
+        choices=["vae", "gan", "ddpm"],
+        help="выбор одной модели для генерации",
+    )
+    mode.add_argument(
+        "--compare", action="store_true", help="сравнительный постер всех трёх моделей"
+    )
 
     # Чекпоинты
-    parser.add_argument("--checkpoint", type=str, default=None,
-                        help="путь к чекпоинту (для --model)")
-    parser.add_argument("--vae_ckpt",  type=str, default="checkpoints/vae/best.pt")
-    parser.add_argument("--gan_ckpt",  type=str, default="checkpoints/gan/best.pt")
+    parser.add_argument(
+        "--checkpoint", type=str, default=None, help="путь к чекпоинту (для --model)"
+    )
+    parser.add_argument("--vae_ckpt", type=str, default="checkpoints/vae/best.pt")
+    parser.add_argument("--gan_ckpt", type=str, default="checkpoints/gan/best.pt")
     parser.add_argument("--ddpm_ckpt", type=str, default="checkpoints/ddpm/best.pt")
 
     # Параметры генерации
-    parser.add_argument("--n_samples",  type=int, default=64,
-                        help="количество генерируемых изображений")
-    parser.add_argument("--nrow",       type=int, default=8,
-                        help="изображений в строке сетки")
-    parser.add_argument("--output",     type=str, default=None,
-                        help="путь для сохранения результата")
+    parser.add_argument(
+        "--n_samples", type=int, default=64, help="количество генерируемых изображений"
+    )
+    parser.add_argument(
+        "--nrow", type=int, default=8, help="изображений в строке сетки"
+    )
+    parser.add_argument(
+        "--output", type=str, default=None, help="путь для сохранения результата"
+    )
 
     # Параметры моделей (если нет в чекпоинте)
-    parser.add_argument("--latent_dim",    type=int,   default=256)
-    parser.add_argument("--beta",          type=float, default=4.0)
-    parser.add_argument("--ngf",           type=int,   default=64)
-    parser.add_argument("--gan_latent",    type=int,   default=100,
-                        help="latent_dim для GAN")
-    parser.add_argument("--base_channels", type=int,   default=64)
-    parser.add_argument("--time_emb_dim",  type=int,   default=256)
-    parser.add_argument("--timesteps",     type=int,   default=1000)
-    parser.add_argument("--schedule",      type=str,   default="cosine")
+    parser.add_argument("--latent_dim", type=int, default=256)
+    parser.add_argument("--beta", type=float, default=4.0)
+    parser.add_argument("--ngf", type=int, default=64)
+    parser.add_argument(
+        "--gan_latent", type=int, default=100, help="latent_dim для GAN"
+    )
+    parser.add_argument("--base_channels", type=int, default=64)
+    parser.add_argument("--time_emb_dim", type=int, default=256)
+    parser.add_argument("--timesteps", type=int, default=1000)
+    parser.add_argument("--schedule", type=str, default="cosine")
+    parser.add_argument(
+        "--image_size",
+        type=int,
+        default=128,
+        help="размер генерируемых изображений DDPM",
+    )
 
-    parser.add_argument("--device",  type=str, default="auto")
-    parser.add_argument("--seed",    type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto")
+    parser.add_argument("--seed", type=int, default=42)
 
     return parser.parse_args()
 
@@ -89,6 +106,7 @@ def parse_args() -> argparse.Namespace:
 # Загрузчики моделей
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def load_vae(checkpoint_path: str, args, device: torch.device) -> "VAE":
     from VAE.vae import VAE
 
@@ -96,7 +114,7 @@ def load_vae(checkpoint_path: str, args, device: torch.device) -> "VAE":
     ckpt = load_checkpoint(checkpoint_path, device=str(device))
     ckpt_args = ckpt.get("args", {})
     latent_dim = ckpt_args.get("latent_dim", args.latent_dim)
-    beta       = ckpt_args.get("beta",       args.beta)
+    beta = ckpt_args.get("beta", args.beta)
 
     model = VAE(latent_dim=latent_dim, beta=beta).to(device)
     model.load_state_dict(ckpt["model"])
@@ -109,12 +127,13 @@ def load_gan(checkpoint_path: str, args, device: torch.device) -> "Generator":
     from GAN.gan import Generator
 
     ckpt = load_checkpoint(checkpoint_path, device=str(device))
-    ckpt_args  = ckpt.get("args", {})
+    ckpt_args = ckpt.get("args", {})
     latent_dim = ckpt_args.get("latent_dim", args.gan_latent)
-    ngf        = ckpt_args.get("ngf",        args.ngf)
+    ngf = ckpt_args.get("ngf", args.ngf)
 
     G = Generator(latent_dim=latent_dim, ngf=ngf).to(device)
-    G.load_state_dict(ckpt["G"])
+    g_state = ckpt.get("G") or ckpt.get("model") or ckpt.get("generator")
+    G.load_state_dict(g_state)
     G.eval()
     print(f"  ✓ Generator загружен (latent_dim={latent_dim}, ngf={ngf})")
     return G
@@ -125,10 +144,10 @@ def load_ddpm(checkpoint_path: str, args, device: torch.device):
 
     ckpt = load_checkpoint(checkpoint_path, device=str(device))
     ckpt_args = ckpt.get("args", {})
-    base_ch   = ckpt_args.get("base_channels", args.base_channels)
-    emb_dim   = ckpt_args.get("time_emb_dim",  args.time_emb_dim)
-    timesteps = ckpt_args.get("timesteps",      args.timesteps)
-    schedule  = ckpt_args.get("schedule",       args.schedule)
+    base_ch = ckpt_args.get("base_channels", args.base_channels)
+    emb_dim = ckpt_args.get("time_emb_dim", args.time_emb_dim)
+    timesteps = ckpt_args.get("timesteps", args.timesteps)
+    schedule = ckpt_args.get("schedule", args.schedule)
 
     unet = UNet(img_channels=3, base_channels=base_ch, time_emb_dim=emb_dim).to(device)
 
@@ -148,25 +167,29 @@ def load_ddpm(checkpoint_path: str, args, device: torch.device):
 # Генерация одной модели
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 @torch.no_grad()
 def generate_vae(model, n: int, device: torch.device) -> torch.Tensor:
     return model.sample(n=n, device=str(device))
 
 
 @torch.no_grad()
-def generate_gan(G, n: int, device: torch.device, latent_dim: int = 100) -> torch.Tensor:
+def generate_gan(
+    G, n: int, device: torch.device, latent_dim: int = 100
+) -> torch.Tensor:
     z = torch.randn(n, latent_dim, 1, 1, device=device)
     return G(z)
 
 
 @torch.no_grad()
-def generate_ddpm(ddpm, n: int) -> torch.Tensor:
-    return ddpm.sample(n=n, img_shape=(3, 128, 128), verbose=True)
+def generate_ddpm(ddpm, n: int, image_size: int = 128) -> torch.Tensor:
+    return ddpm.sample(n=n, img_shape=(3, image_size, image_size), verbose=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 def main():
     args = parse_args()
@@ -174,10 +197,6 @@ def main():
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs")
-            device = torch.nn.DataParallel(device)
     else:
         device = torch.device(args.device)
 
@@ -193,8 +212,8 @@ def main():
             print("\n[1/3] VAE...")
             vae = load_vae(args.vae_ckpt, args, device)
             results["VAE"] = {
-                "samples":      generate_vae(vae, 16, device),
-                "loss_history": [],   # можно загрузить из CSV если нужно
+                "samples": generate_vae(vae, 16, device),
+                "loss_history": [],  # можно загрузить из CSV если нужно
             }
         else:
             print(f"  ⚠️  VAE чекпоинт не найден: {args.vae_ckpt}")
@@ -206,7 +225,7 @@ def main():
             gan_ld = ckpt_g.get("args", {}).get("latent_dim", args.gan_latent)
             G = load_gan(args.gan_ckpt, args, device)
             results["GAN"] = {
-                "samples":      generate_gan(G, 16, device, latent_dim=gan_ld),
+                "samples": generate_gan(G, 16, device, latent_dim=gan_ld),
                 "loss_history": [],
             }
         else:
@@ -217,7 +236,7 @@ def main():
             print("\n[3/3] DDPM (медленно)...")
             ddpm = load_ddpm(args.ddpm_ckpt, args, device)
             results["DDPM"] = {
-                "samples":      generate_ddpm(ddpm, 16),
+                "samples": generate_ddpm(ddpm, 16, args.image_size),
                 "loss_history": [],
             }
         else:
@@ -255,9 +274,11 @@ def main():
         samples = generate_gan(G, args.n_samples, device, latent_dim=gan_ld)
 
     elif args.model == "ddpm":
-        print(f"⏳ DDPM семплинг занимает ~{args.timesteps} forward-пассов через UNet...")
+        print(
+            f"⏳ DDPM семплинг занимает ~{args.timesteps} forward-пассов через UNet..."
+        )
         ddpm = load_ddpm(ckpt_path, args, device)
-        samples = generate_ddpm(ddpm, args.n_samples)
+        samples = generate_ddpm(ddpm, args.n_samples, args.image_size)
 
     # Сохраняем результат
     output_path = args.output or f"infer/{args.model}_samples.png"

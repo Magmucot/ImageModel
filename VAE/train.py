@@ -127,7 +127,7 @@ def main() -> None:
         lr=get_config_value(cfg, "lr", 1e-4),
         weight_decay=get_config_value(cfg, "weight_decay", 1e-5),
     )
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
     epochs = get_config_value(cfg, "epochs", 50)
@@ -168,9 +168,10 @@ def main() -> None:
                 model.eval()
                 with torch.no_grad():
                     raw_model = model.module if hasattr(model, "module") else model
-                    z = torch.randn(64, latent_dim, device=device)
+                    n_samples = get_config_value(cfg, "n_samples", 64)
+                    z = torch.randn(n_samples, latent_dim, device=device)
                     samples = raw_model.decode(z)
-                    save_samples(samples, f"samples/vae/epoch_{epoch:03d}.png")
+                    save_samples(samples, save_dir / f"samples/epoch_{epoch:03d}.png")
 
                 save_checkpoint(
                     {

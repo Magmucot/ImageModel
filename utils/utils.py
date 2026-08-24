@@ -42,9 +42,7 @@ def load_config(
     path = Path(config_path)
 
     if not path.exists():
-        raise FileNotFoundError(
-            f"Конфигурация не найдена: {path}"
-        )
+        raise FileNotFoundError(f"Конфигурация не найдена: {path}")
 
     with path.open(
         "r",
@@ -90,9 +88,7 @@ def get_config_value(
     }
 
     if key in aliases:
-        section_name, section_key = (
-            aliases[key]
-        )
+        section_name, section_key = aliases[key]
 
         section = config.get(
             section_name,
@@ -125,9 +121,7 @@ def count_parameters(
     """Количество обучаемых параметров."""
 
     return sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
 
 
@@ -142,18 +136,12 @@ def print_model_info(
 
     model = unwrap_model(model)
 
-    total = count_parameters(
-        model
-    )
+    total = count_parameters(model)
 
     print()
     print("=" * 64)
     print(model_name)
-    print(
-        "Обучаемых параметров: "
-        f"{total:,} "
-        f"({total / 1e6:.2f}M)"
-    )
+    print(f"Обучаемых параметров: {total:,} ({total / 1e6:.2f}M)")
     print("=" * 64)
     print()
 
@@ -163,10 +151,7 @@ def denormalize(
 ) -> torch.Tensor:
     """[-1, 1] -> [0, 1]."""
 
-    return (
-        tensor.detach().cpu()
-        + 1.0
-    ) / 2.0
+    return (tensor.detach().cpu() + 1.0) / 2.0
 
 
 def save_sample_grid(
@@ -186,9 +171,7 @@ def save_sample_grid(
         exist_ok=True,
     )
 
-    images = denormalize(
-        images
-    ).clamp(0.0, 1.0)
+    images = denormalize(images).clamp(0.0, 1.0)
 
     vutils.save_image(
         images,
@@ -200,6 +183,69 @@ def save_sample_grid(
         # Заголовок опциональный.
         # Сам PNG уже сохранён выше.
         pass
+
+
+def compare_models(
+    results: dict[str, dict],
+    save_path: str | Path,
+    nrow: int = 8,
+) -> Path | None:
+    """
+    Сохраняет сравнительный постер из семплов нескольких моделей.
+
+    Args:
+        results: {имя_модели: {"samples": tensor(B,C,H,W), ...}}
+        save_path: путь для сохранения PNG.
+        nrow: изображений в строке внутри сетки каждой модели.
+
+    Returns:
+        Путь к сохранённому файлу или None (не main process / нет данных).
+    """
+
+    if not is_main_process():
+        return None
+
+    entries = {
+        name: content["samples"]
+        for name, content in results.items()
+        if isinstance(content, dict) and content.get("samples") is not None
+    }
+
+    if not entries:
+        return None
+
+    path = Path(save_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_models = len(entries)
+
+    fig, axes = plt.subplots(
+        n_models,
+        1,
+        figsize=(10, 4 * n_models),
+    )
+
+    axes = np.atleast_1d(axes).reshape(-1)
+
+    for ax, (name, samples) in zip(axes, entries.items()):
+        grid = vutils.make_grid(
+            denormalize(samples).clamp(0.0, 1.0).cpu(),
+            nrow=nrow,
+            padding=2,
+        )
+
+        ax.imshow(grid.permute(1, 2, 0).numpy())
+        ax.set_title(name, fontsize=14)
+        ax.axis("off")
+
+    for ax in axes[len(entries) :]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+    return path
 
 
 def save_samples(
@@ -230,9 +276,7 @@ def save_samples(
     }
 
     if normalize:
-        kwargs["value_range"] = (
-            value_range
-        )
+        kwargs["value_range"] = value_range
 
     vutils.save_image(
         images.detach().cpu(),
@@ -272,16 +316,10 @@ def save_checkpoint(
     if not is_main_process():
         return ""
 
-    directory = (
-        checkpoint_dir
-        if checkpoint_dir is not None
-        else output_dir
-    )
+    directory = checkpoint_dir if checkpoint_dir is not None else output_dir
 
     if directory is None:
-        raise ValueError(
-            "Не указан output_dir/checkpoint_dir."
-        )
+        raise ValueError("Не указан output_dir/checkpoint_dir.")
 
     directory = Path(directory)
 
@@ -290,9 +328,7 @@ def save_checkpoint(
         exist_ok=True,
     )
 
-    path = (
-        directory / filename
-    )
+    path = directory / filename
 
     payload = dict(state)
 
@@ -302,11 +338,7 @@ def save_checkpoint(
         payload.get("model"),
         torch.nn.Module,
     ):
-        payload["model"] = (
-            unwrap_model(
-                payload["model"]
-            ).state_dict()
-        )
+        payload["model"] = unwrap_model(payload["model"]).state_dict()
 
     # Старый GAN API может использовать
     # model_g / model_d.
@@ -322,11 +354,7 @@ def save_checkpoint(
             value,
             torch.nn.Module,
         ):
-            payload[key] = (
-                unwrap_model(
-                    value
-                ).state_dict()
-            )
+            payload[key] = unwrap_model(value).state_dict()
 
     # Optimizer objects -> state_dict.
     for key in (
@@ -343,45 +371,31 @@ def save_checkpoint(
             value,
             "state_dict",
         ):
-            payload[key] = (
-                value.state_dict()
-            )
+            payload[key] = value.state_dict()
 
-    scaler = payload.get(
-        "scaler"
-    )
+    scaler = payload.get("scaler")
 
     if hasattr(
         scaler,
         "state_dict",
     ):
-        payload[
-            "scaler"
-        ] = scaler.state_dict()
+        payload["scaler"] = scaler.state_dict()
 
-    scaler_g = payload.get(
-        "scaler_g"
-    )
+    scaler_g = payload.get("scaler_g")
 
     if hasattr(
         scaler_g,
         "state_dict",
     ):
-        payload[
-            "scaler_g"
-        ] = scaler_g.state_dict()
+        payload["scaler_g"] = scaler_g.state_dict()
 
-    scaler_d = payload.get(
-        "scaler_d"
-    )
+    scaler_d = payload.get("scaler_d")
 
     if hasattr(
         scaler_d,
         "state_dict",
     ):
-        payload[
-            "scaler_d"
-        ] = scaler_d.state_dict()
+        payload["scaler_d"] = scaler_d.state_dict()
 
     torch.save(
         payload,
@@ -406,9 +420,7 @@ def load_checkpoint(
     path = Path(path)
 
     if not path.exists():
-        raise FileNotFoundError(
-            f"Чекпоинт не найден: {path}"
-        )
+        raise FileNotFoundError(f"Чекпоинт не найден: {path}")
 
     checkpoint = torch.load(
         path,
@@ -416,12 +428,7 @@ def load_checkpoint(
         weights_only=False,
     )
 
-    print(
-        f"Checkpoint loaded: {path}"
-        f" "
-        f"(epoch="
-        f"{checkpoint.get('epoch', '?')})"
-    )
+    print(f"Checkpoint loaded: {path} (epoch={checkpoint.get('epoch', '?')})")
 
     return checkpoint
 
@@ -434,9 +441,7 @@ class TrainingLogger:
         output_dir: str | Path,
         model_name: str = "Model",
     ):
-        self.output_dir = Path(
-            output_dir
-        )
+        self.output_dir = Path(output_dir)
 
         self.output_dir.mkdir(
             parents=True,
@@ -445,22 +450,15 @@ class TrainingLogger:
 
         self.model_name = model_name
 
-        self.csv_path = (
-            self.output_dir
-            / "training_log.csv"
-        )
+        self.csv_path = self.output_dir / "training_log.csv"
 
         self._file = None
         self._writer = None
         self._fieldnames = []
 
-        self.history = defaultdict(
-            list
-        )
+        self.history = defaultdict(list)
 
-        self.epoch_history = defaultdict(
-            list
-        )
+        self.epoch_history = defaultdict(list)
 
         self._start_time = time.time()
 
@@ -470,10 +468,7 @@ class TrainingLogger:
         step: int,
         **metrics: float,
     ) -> None:
-        elapsed = (
-            time.time()
-            - self._start_time
-        )
+        elapsed = time.time() - self._start_time
 
         row = {
             "epoch": epoch,
@@ -483,9 +478,7 @@ class TrainingLogger:
         }
 
         if self._writer is None:
-            self._fieldnames = list(
-                row.keys()
-            )
+            self._fieldnames = list(row.keys())
 
             self._file = open(
                 self.csv_path,
@@ -494,12 +487,10 @@ class TrainingLogger:
                 encoding="utf-8",
             )
 
-            self._writer = (
-                csv.DictWriter(
-                    self._file,
-                    fieldnames=self._fieldnames,
-                    extrasaction="ignore",
-                )
+            self._writer = csv.DictWriter(
+                self._file,
+                fieldnames=self._fieldnames,
+                extrasaction="ignore",
             )
 
             self._writer.writeheader()
@@ -517,46 +508,32 @@ class TrainingLogger:
         self._file.flush()
 
         for key, value in metrics.items():
-            self.history[key].append(
-                float(value)
-            )
+            self.history[key].append(float(value))
 
     def log_epoch(
         self,
         epoch: int,
         **metrics: float,
     ) -> None:
-        self.epoch_history[
-            "epoch"
-        ].append(epoch)
+        self.epoch_history["epoch"].append(epoch)
 
         for key, value in metrics.items():
-            self.epoch_history[
-                key
-            ].append(float(value))
+            self.epoch_history[key].append(float(value))
 
     def print_epoch_summary(
         self,
         epoch: int,
         **metrics: float,
     ) -> None:
-        elapsed = (
-            time.time()
-            - self._start_time
-        )
+        elapsed = time.time() - self._start_time
 
         metrics_str = " | ".join(
-            f"{key}: {value:.5f}"
-            for key, value in metrics.items()
+            f"{key}: {value:.5f}" for key, value in metrics.items()
         )
 
         print()
         print("-" * 72)
-        print(
-            f"Epoch {epoch:04d} | "
-            f"{metrics_str} | "
-            f"{elapsed:.0f}s"
-        )
+        print(f"Epoch {epoch:04d} | {metrics_str} | {elapsed:.0f}s")
         print("-" * 72)
 
     def close(self) -> None:
@@ -573,14 +550,9 @@ class Visualizer:
         model_name: str,
         inline: bool = False,
     ):
-        self.output_dir = Path(
-            output_dir
-        )
+        self.output_dir = Path(output_dir)
 
-        self.plots_dir = (
-            self.output_dir
-            / "plots"
-        )
+        self.plots_dir = self.output_dir / "plots"
 
         self.plots_dir.mkdir(
             parents=True,
@@ -591,9 +563,7 @@ class Visualizer:
         self.inline = inline
 
         if not inline:
-            matplotlib.use(
-                "Agg"
-            )
+            matplotlib.use("Agg")
 
     def plot_curves(
         self,
@@ -603,10 +573,7 @@ class Visualizer:
         show: bool = False,
     ) -> str | None:
         histories = {
-            key: value
-            for key, value
-            in epoch_history.items()
-            if key != "epoch"
+            key: value for key, value in epoch_history.items() if key != "epoch"
         }
 
         if not histories:
@@ -617,10 +584,7 @@ class Visualizer:
             len(histories),
         )
 
-        rows = math.ceil(
-            len(histories)
-            / columns
-        )
+        rows = math.ceil(len(histories) / columns)
 
         fig, axes = plt.subplots(
             rows,
@@ -631,16 +595,12 @@ class Visualizer:
             ),
         )
 
-        axes = np.atleast_1d(
-            axes
-        ).reshape(-1)
+        axes = np.atleast_1d(axes).reshape(-1)
 
         for index, (
             name,
             values,
-        ) in enumerate(
-            histories.items()
-        ):
+        ) in enumerate(histories.items()):
             ax = axes[index]
 
             ax.plot(
@@ -658,34 +618,24 @@ class Visualizer:
                 )
             )
 
-            ax.set_xlabel(
-                "Epoch"
-            )
+            ax.set_xlabel("Epoch")
 
             ax.grid(
                 True,
                 alpha=0.3,
             )
 
-        for ax in axes[
-            len(histories):
-        ]:
+        for ax in axes[len(histories) :]:
             ax.set_visible(False)
 
-        fig.suptitle(
-            f"{self.model_name} "
-            f"— Epoch {epoch}"
-        )
+        fig.suptitle(f"{self.model_name} — Epoch {epoch}")
 
         fig.tight_layout()
 
         output = None
 
         if save:
-            output = str(
-                self.plots_dir
-                / f"epoch_{epoch:04d}.png"
-            )
+            output = str(self.plots_dir / f"epoch_{epoch:04d}.png")
 
             fig.savefig(
                 output,
