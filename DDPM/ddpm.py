@@ -39,9 +39,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         super().__init__()
 
         if dim < 4:
-            raise ValueError(
-                "time_emb_dim должен быть >= 4."
-            )
+            raise ValueError("time_emb_dim должен быть >= 4.")
 
         self.dim = dim
 
@@ -51,10 +49,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
     ) -> torch.Tensor:
         half_dim = self.dim // 2
 
-        exponent = (
-            math.log(10000.0)
-            / max(half_dim - 1, 1)
-        )
+        exponent = math.log(10000.0) / max(half_dim - 1, 1)
 
         frequencies = torch.exp(
             torch.arange(
@@ -65,10 +60,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
             * -exponent
         )
 
-        embeddings = (
-            t.float()[:, None]
-            * frequencies[None, :]
-        )
+        embeddings = t.float()[:, None] * frequencies[None, :]
 
         embeddings = torch.cat(
             (
@@ -147,9 +139,7 @@ class ResNetBlock(nn.Module):
             out_channels,
         )
 
-        self.dropout = nn.Dropout(
-            dropout
-        )
+        self.dropout = nn.Dropout(dropout)
 
         self.conv2 = nn.Conv2d(
             out_channels,
@@ -181,14 +171,9 @@ class ResNetBlock(nn.Module):
         h = self.act(h)
         h = self.conv1(h)
 
-        time_emb = self.time_proj(
-            temb
-        )
+        time_emb = self.time_proj(temb)
 
-        h = (
-            h
-            + time_emb[:, :, None, None]
-        )
+        h = h + time_emb[:, :, None, None]
 
         h = self.norm2(h)
         h = self.act(h)
@@ -214,18 +199,11 @@ class SelfAttention2d(nn.Module):
         super().__init__()
 
         if channels % num_heads != 0:
-            raise ValueError(
-                "channels должен делиться "
-                "на num_heads."
-            )
+            raise ValueError("channels должен делиться на num_heads.")
 
         self.num_heads = num_heads
-        self.head_dim = (
-            channels // num_heads
-        )
-        self.scale = (
-            self.head_dim ** -0.5
-        )
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim**-0.5
 
         groups = min(
             8,
@@ -257,9 +235,7 @@ class SelfAttention2d(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        batch, channels, height, width = (
-            x.shape
-        )
+        batch, channels, height, width = x.shape
 
         residual = x
 
@@ -298,10 +274,7 @@ class SelfAttention2d(nn.Module):
             k.transpose(-2, -1),
         )
 
-        attention = (
-            attention
-            * self.scale
-        )
+        attention = attention * self.scale
 
         attention = torch.softmax(
             attention,
@@ -329,10 +302,7 @@ class SelfAttention2d(nn.Module):
             )
         )
 
-        return (
-            self.proj(out)
-            + residual
-        )
+        return self.proj(out) + residual
 
 
 # ============================================================================
@@ -367,11 +337,7 @@ class DownBlock(nn.Module):
             dropout,
         )
 
-        self.attn = (
-            SelfAttention2d(out_ch)
-            if use_attn
-            else nn.Identity()
-        )
+        self.attn = SelfAttention2d(out_ch) if use_attn else nn.Identity()
 
         self.down = nn.Conv2d(
             out_ch,
@@ -442,11 +408,7 @@ class UpBlock(nn.Module):
             dropout,
         )
 
-        self.attn = (
-            SelfAttention2d(out_ch)
-            if use_attn
-            else nn.Identity()
-        )
+        self.attn = SelfAttention2d(out_ch) if use_attn else nn.Identity()
 
     def forward(
         self,
@@ -512,16 +474,12 @@ class UNet(nn.Module):
         super().__init__()
 
         if base_channels < 8:
-            raise ValueError(
-                "base_channels должен быть >= 8."
-            )
+            raise ValueError("base_channels должен быть >= 8.")
 
         ch = base_channels
 
         self.time_mlp = nn.Sequential(
-            SinusoidalPositionEmbeddings(
-                time_emb_dim
-            ),
+            SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(
                 time_emb_dim,
                 time_emb_dim * 4,
@@ -587,9 +545,7 @@ class UNet(nn.Module):
             dropout,
         )
 
-        self.mid_attn = SelfAttention2d(
-            ch * 8
-        )
+        self.mid_attn = SelfAttention2d(ch * 8)
 
         self.mid_res2 = ResNetBlock(
             ch * 8,
@@ -746,9 +702,7 @@ def get_beta_schedule(
     """Создаёт beta schedule."""
 
     if timesteps <= 0:
-        raise ValueError(
-            "timesteps должен быть > 0."
-        )
+        raise ValueError("timesteps должен быть > 0.")
 
     if schedule == "linear":
         return torch.linspace(
@@ -770,34 +724,18 @@ def get_beta_schedule(
             dtype=torch.float32,
         )
 
-        alpha_bar = torch.cos(
-            (
-                x / timesteps
-                + s
-            )
-            / (1.0 + s)
-            * math.pi
-            * 0.5
-        ).pow(2)
+        alpha_bar = torch.cos((x / timesteps + s) / (1.0 + s) * math.pi * 0.5).pow(2)
 
-        alpha_bar = (
-            alpha_bar
-            / alpha_bar[0]
-        )
+        alpha_bar = alpha_bar / alpha_bar[0]
 
-        betas = 1.0 - (
-            alpha_bar[1:]
-            / alpha_bar[:-1]
-        )
+        betas = 1.0 - (alpha_bar[1:] / alpha_bar[:-1])
 
         return betas.clamp(
             1e-5,
             0.999,
         )
 
-    raise ValueError(
-        f"Неизвестное расписание: {schedule!r}"
-    )
+    raise ValueError(f"Неизвестное расписание: {schedule!r}")
 
 
 # ============================================================================
@@ -832,12 +770,7 @@ def extract(
 
     return out.reshape(
         t.shape[0],
-        *(
-            1
-            for _ in range(
-                len(shape) - 1
-            )
-        ),
+        *(1 for _ in range(len(shape) - 1)),
     )
 
 
@@ -866,13 +799,9 @@ class DDPM:
         schedule: str = "cosine",
         device: str | torch.device = "cuda",
     ):
-        self.device = torch.device(
-            device
-        )
+        self.device = torch.device(device)
 
-        self.model = model.to(
-            self.device
-        )
+        self.model = model.to(self.device)
 
         self.timesteps = timesteps
         self.schedule = schedule
@@ -884,15 +813,11 @@ class DDPM:
 
         self.betas = betas
 
-        self.alphas = (
-            1.0 - betas
-        )
+        self.alphas = 1.0 - betas
 
-        self.alphas_cumprod = (
-            torch.cumprod(
-                self.alphas,
-                dim=0,
-            )
+        self.alphas_cumprod = torch.cumprod(
+            self.alphas,
+            dim=0,
         )
 
         self.alphas_cumprod_prev = F.pad(
@@ -901,66 +826,26 @@ class DDPM:
             value=1.0,
         )
 
-        self.sqrt_alphas_cumprod = (
-            torch.sqrt(
-                self.alphas_cumprod
-            )
-        )
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
 
-        self.sqrt_one_minus_alphas_cumprod = (
-            torch.sqrt(
-                1.0
-                - self.alphas_cumprod
-            )
-        )
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
 
-        self.sqrt_recip_alphas = (
-            torch.sqrt(
-                1.0 / self.alphas
-            )
-        )
+        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
 
         self.posterior_variance = (
-            betas
-            * (
-                1.0
-                - self.alphas_cumprod_prev
-            )
-            / (
-                1.0
-                - self.alphas_cumprod
-            )
+            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
 
-        self.posterior_variance = (
-            self.posterior_variance.clamp(
-                min=1e-20
-            )
-        )
+        self.posterior_variance = self.posterior_variance.clamp(min=1e-20)
 
         self.posterior_mean_coef1 = (
-            betas
-            * torch.sqrt(
-                self.alphas_cumprod_prev
-            )
-            / (
-                1.0
-                - self.alphas_cumprod
-            )
+            betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         )
 
         self.posterior_mean_coef2 = (
-            (
-                1.0
-                - self.alphas_cumprod_prev
-            )
-            * torch.sqrt(
-                self.alphas
-            )
-            / (
-                1.0
-                - self.alphas_cumprod
-            )
+            (1.0 - self.alphas_cumprod_prev)
+            * torch.sqrt(self.alphas)
+            / (1.0 - self.alphas_cumprod)
         )
 
     # ========================================================================
@@ -971,9 +856,7 @@ class DDPM:
         self,
         x_0: torch.Tensor,
         t: torch.Tensor,
-        noise: Optional[
-            torch.Tensor
-        ] = None,
+        noise: Optional[torch.Tensor] = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -985,9 +868,7 @@ class DDPM:
         """
 
         if noise is None:
-            noise = torch.randn_like(
-                x_0
-            )
+            noise = torch.randn_like(x_0)
 
         sqrt_alpha_bar = extract(
             self.sqrt_alphas_cumprod,
@@ -1001,10 +882,7 @@ class DDPM:
             x_0.shape,
         )
 
-        x_t = (
-            sqrt_alpha_bar * x_0
-            + sqrt_one_minus * noise
-        )
+        x_t = sqrt_alpha_bar * x_0 + sqrt_one_minus * noise
 
         return x_t, noise
 
@@ -1095,22 +973,14 @@ class DDPM:
             x.shape,
         )
 
-        sqrt_one_minus_alpha_bar = (
-            extract(
-                self.sqrt_one_minus_alphas_cumprod,
-                t,
-                x.shape,
-            )
+        sqrt_one_minus_alpha_bar = extract(
+            self.sqrt_one_minus_alphas_cumprod,
+            t,
+            x.shape,
         )
 
         # Predicted x0.
-        x0_pred = (
-            x
-            - sqrt_one_minus_alpha_bar
-            * noise_pred
-        ) / torch.sqrt(
-            alpha_bar
-        )
+        x0_pred = (x - sqrt_one_minus_alpha_bar * noise_pred) / torch.sqrt(alpha_bar)
 
         x0_pred = x0_pred.clamp(
             -1.0,
@@ -1129,10 +999,7 @@ class DDPM:
             x.shape,
         )
 
-        posterior_mean = (
-            coef1 * x0_pred
-            + coef2 * x
-        )
+        posterior_mean = coef1 * x0_pred + coef2 * x
 
         if t_idx == 0:
             return posterior_mean
@@ -1143,17 +1010,9 @@ class DDPM:
             x.shape,
         )
 
-        noise = torch.randn_like(
-            x
-        )
+        noise = torch.randn_like(x)
 
-        return (
-            posterior_mean
-            + torch.sqrt(
-                variance
-            )
-            * noise
-        )
+        return posterior_mean + torch.sqrt(variance) * noise
 
     # ========================================================================
     # DDPM sampling
@@ -1177,11 +1036,7 @@ class DDPM:
         Возвращает tensor в [-1, 1].
         """
 
-        sample_device = (
-            torch.device(device)
-            if device is not None
-            else self.device
-        )
+        sample_device = torch.device(device) if device is not None else self.device
 
         self.model.eval()
 
@@ -1202,7 +1057,7 @@ class DDPM:
                 from tqdm import tqdm
 
                 steps = tqdm(
-                    steps,
+                    list(steps),
                     total=self.timesteps,
                     desc="DDPM Sampling",
                 )
@@ -1252,21 +1107,12 @@ class DDPM:
         """
 
         if sampling_steps <= 0:
-            raise ValueError(
-                "sampling_steps должен быть > 0."
-            )
+            raise ValueError("sampling_steps должен быть > 0.")
 
         if sampling_steps > self.timesteps:
-            raise ValueError(
-                "sampling_steps не может быть "
-                "больше timesteps."
-            )
+            raise ValueError("sampling_steps не может быть больше timesteps.")
 
-        sample_device = (
-            torch.device(device)
-            if device is not None
-            else self.device
-        )
+        sample_device = torch.device(device) if device is not None else self.device
 
         self.model.eval()
 
@@ -1276,38 +1122,34 @@ class DDPM:
             device=sample_device,
         )
 
-        timesteps = torch.linspace(
-            0,
-            self.timesteps - 1,
-            sampling_steps,
-            device=sample_device,
-        ).round().long()
-
-        timesteps = torch.unique(
-            timesteps
+        timesteps = (
+            torch.linspace(
+                0,
+                self.timesteps - 1,
+                sampling_steps,
+                device=sample_device,
+            )
+            .round()
+            .long()
         )
 
-        timesteps = timesteps.flip(
-            0
-        )
+        timesteps = torch.unique(timesteps)
+
+        timesteps = timesteps.flip(0)
 
         if verbose:
             try:
                 from tqdm import tqdm
 
                 timesteps = tqdm(
-                    timesteps,
+                    timesteps.tolist(),
                     desc="DDIM Sampling",
                 )
             except ImportError:
                 pass
 
-        for index, t_idx_tensor in enumerate(
-            timesteps
-        ):
-            t_idx = int(
-                t_idx_tensor.item()
-            )
+        for index, t_idx_tensor in enumerate(timesteps):
+            t_idx = int(t_idx_tensor)
 
             t = torch.full(
                 (n,),
@@ -1327,40 +1169,21 @@ class DDPM:
                 x.shape,
             )
 
-            sqrt_alpha_bar = torch.sqrt(
-                alpha_bar
-            )
+            sqrt_alpha_bar = torch.sqrt(alpha_bar)
 
-            sqrt_one_minus_alpha_bar = (
-                torch.sqrt(
-                    1.0
-                    - alpha_bar
-                )
-            )
+            sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar)
 
-            x0_pred = (
-                x
-                - sqrt_one_minus_alpha_bar
-                * noise_pred
-            ) / sqrt_alpha_bar
+            x0_pred = (x - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
 
             x0_pred = x0_pred.clamp(
                 -1.0,
                 1.0,
             )
 
-            if index == len(
-                timesteps
-            ) - 1:
-                alpha_bar_prev = torch.ones_like(
-                    alpha_bar
-                )
+            if index == len(timesteps) - 1:
+                alpha_bar_prev = torch.ones_like(alpha_bar)
             else:
-                prev_t = int(
-                    timesteps[
-                        index + 1
-                    ].item()
-                )
+                prev_t = int(timesteps[index + 1])
 
                 prev_t_tensor = torch.full(
                     (n,),
@@ -1377,47 +1200,18 @@ class DDPM:
 
             sigma = (
                 eta
-                * torch.sqrt(
-                    (
-                        1.0
-                        - alpha_bar_prev
-                    )
-                    / (
-                        1.0
-                        - alpha_bar
-                    )
-                )
-                * torch.sqrt(
-                    1.0
-                    - alpha_bar
-                    / alpha_bar_prev
-                )
+                * torch.sqrt((1.0 - alpha_bar_prev) / (1.0 - alpha_bar))
+                * torch.sqrt(1.0 - alpha_bar / alpha_bar_prev)
             )
 
-            direction = torch.sqrt(
-                (
-                    1.0
-                    - alpha_bar_prev
-                    - sigma.pow(2)
-                ).clamp(
-                    min=0.0
-                )
-            ) * noise_pred
-
-            noise = (
-                torch.randn_like(x)
-                if eta > 0
-                else torch.zeros_like(x)
+            direction = (
+                torch.sqrt((1.0 - alpha_bar_prev - sigma.pow(2)).clamp(min=0.0))
+                * noise_pred
             )
 
-            x = (
-                torch.sqrt(
-                    alpha_bar_prev
-                )
-                * x0_pred
-                + direction
-                + sigma * noise
-            )
+            noise = torch.randn_like(x) if eta > 0 else torch.zeros_like(x)
+
+            x = torch.sqrt(alpha_bar_prev) * x0_pred + direction + sigma * noise
 
         return x.clamp(
             -1.0,
@@ -1431,15 +1225,9 @@ class DDPM:
 
 
 if __name__ == "__main__":
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(
-        f"Device: {device}"
-    )
+    print(f"Device: {device}")
 
     model = UNet(
         img_channels=3,
@@ -1475,26 +1263,14 @@ if __name__ == "__main__":
         t,
     )
 
-    print(
-        f"Input: {tuple(x.shape)}"
-    )
+    print(f"Input: {tuple(x.shape)}")
 
-    print(
-        f"Pred:  {tuple(pred.shape)}"
-    )
+    print(f"Pred:  {tuple(pred.shape)}")
 
     loss = ddpm.loss_fn(x)
 
-    print(
-        f"Loss: {loss.item():.4f}"
-    )
+    print(f"Loss: {loss.item():.4f}")
 
-    n_params = sum(
-        p.numel()
-        for p in model.parameters()
-    )
+    n_params = sum(p.numel() for p in model.parameters())
 
-    print(
-        f"Параметров: {n_params:,}"
-        f" ({n_params / 1e6:.2f}M)"
-    )
+    print(f"Параметров: {n_params:,} ({n_params / 1e6:.2f}M)")

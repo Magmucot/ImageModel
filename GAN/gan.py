@@ -12,6 +12,7 @@ DCGAN с Spectral Normalization и Self-Attention для изображений 
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,9 +52,10 @@ class SelfAttention2d(nn.Module):
             return t.permute(0, 1, 3, 2)
 
         q, k, v = to_heads(q), to_heads(k), to_heads(v)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v)
+        # F.scaled_dot_product_attention не материализует матрицу
+        # внимания (H*W x H*W), в отличие от ручного matmul — критично
+        # для 64x64 (иначе ~4 GiB на карту внимания при B=32).
+        out = F.scaled_dot_product_attention(q, k, v)
         out = out.permute(0, 1, 3, 2).contiguous().view(B, C, H, W)
 
         return self.proj(out) * self.gamma + residual

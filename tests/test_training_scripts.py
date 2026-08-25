@@ -249,6 +249,34 @@ class TrainingScriptTests(unittest.TestCase):
         self.assertIn('"label_smooth"', source)
         self.assertIn('"n_critic"', source)
 
+    def test_gan_attention_uses_scaled_dot_product(self) -> None:
+        """Regression OOM: ручной matmul материализует карту внимания 4096x4096."""
+        tree = ast.parse((ROOT / "GAN/gan.py").read_text(encoding="utf-8"))
+        attn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "SelfAttention2d"
+        )
+        calls = {
+            node.func.id
+            for node in ast.walk(attn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertNotIn("matmul", calls)
+        source = (ROOT / "GAN/gan.py").read_text(encoding="utf-8")
+        self.assertIn("scaled_dot_product_attention", source)
+
+    def test_ddpm_sampling_wraps_tqdm_over_list(self) -> None:
+        """Regression: tqdm-обёртка не должна подменять tensor timesteps,
+        к которому потом обращаются по индексу."""
+        source = (ROOT / "DDPM/ddpm.py").read_text(encoding="utf-8")
+        # в ddim_sample: список, а не тензор
+        self.assertIn("timesteps.tolist()", source)
+        self.assertNotIn("prev_t = int(\n                    timesteps[", source)
+        # .item() на элементах обёрнутой последовательности недопустим
+        self.assertNotRegex(source, r"timesteps\[index \+ 1\]\.item\(\)")
+        self.assertNotRegex(source, r"t_idx_tensor\.item\(\)")
+
 
 if __name__ == "__main__":
     unittest.main()
